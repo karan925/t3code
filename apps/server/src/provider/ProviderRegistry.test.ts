@@ -2977,6 +2977,7 @@ it.layer(
             ),
           );
           let cursorSpawned = false;
+          let codeRabbitSpawned = false;
           const scope = yield* Scope.make();
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const layerProviderRegistry = ProviderRegistry.layer.pipe(
@@ -3008,6 +3009,7 @@ it.layer(
             Layer.provideMerge(layerBackgroundPolicyAlwaysRun),
             Layer.provideMerge(
               layerMockCommandSpawner((command, args) => {
+                if (command === "cr") codeRabbitSpawned = true;
                 if (command === "cursor-agent") {
                   cursorSpawned = true;
                 }
@@ -3047,6 +3049,7 @@ it.layer(
             assert.deepStrictEqual(providers.map((provider) => provider.instanceId).toSorted(), [
               "antigravity",
               "claudeAgent",
+              "coderabbit-cloud",
               "codex",
               "cursor",
               "grok",
@@ -3060,6 +3063,16 @@ it.layer(
             const museProvider = providers.find((provider) => provider.driver === "muse");
             assert.strictEqual(museProvider?.enabled, false);
             assert.strictEqual(museProvider?.status, "disabled");
+            const cloudProvider = providers.find(
+              (provider) => provider.driver === "coderabbit-cloud",
+            );
+            assert.strictEqual(cloudProvider?.enabled, false);
+            assert.strictEqual(cloudProvider?.status, "disabled");
+            assert.deepStrictEqual(
+              cloudProvider?.models.map((model) => model.slug),
+              ["default"],
+            );
+            assert.strictEqual(codeRabbitSpawned, false);
             assert.strictEqual(cursorSpawned, false);
           }).pipe(Effect.provide(runtimeServices));
         }),

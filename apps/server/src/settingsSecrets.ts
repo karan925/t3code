@@ -1,3 +1,4 @@
+import { codeRabbitCloudClient } from "@t3tools/provider-coderabbit-cloud/client";
 import {
   AntigravitySettings,
   ClaudeSettings,
@@ -25,7 +26,15 @@ const providerSecretFields = new Map([
   ["codex", secretSettingsFields(CodexSettings)],
   ["claudeAgent", secretSettingsFields(ClaudeSettings)],
   ["antigravity", secretSettingsFields(AntigravitySettings)],
-  ...[cursorClient, grokClient, museClient, openCodeClient, piClient, acpRegistryClient].map(
+  ...[
+    codeRabbitCloudClient,
+    cursorClient,
+    grokClient,
+    museClient,
+    openCodeClient,
+    piClient,
+    acpRegistryClient,
+  ].map(
     (definition) =>
       [definition.driverKind, secretSettingsFields(definition.settingsSchema)] as const,
   ),
