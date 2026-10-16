@@ -5,7 +5,7 @@ language: en-US
 reviews:
   high_level_summary: false
   review_status: true
-  request_changes_workflow: false
+  request_changes_workflow: true
   # Static YAML applies the existing contributor restrictions to every author.
   allow_author_approval: false
   auto_review:
