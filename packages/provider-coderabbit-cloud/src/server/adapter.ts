@@ -143,6 +143,7 @@ interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurn: OrchestrationV2ProviderTurn;
   readonly receipt: Deferred.Deferred<string | null>;
+  readonly messageReceipt: Deferred.Deferred<void>;
   wake: Deferred.Deferred<void>;
   follower: Fiber.Fiber<void> | null;
   taskId: string | null;
@@ -371,6 +372,7 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
           });
         }
         yield* Deferred.succeed(turn.receipt, turn.taskId);
+        yield* Deferred.succeed(turn.messageReceipt, undefined);
         if (active === turn) active = null;
       }, Effect.uninterruptible);
       const ask = Effect.fnUntraced(function* (
@@ -513,6 +515,7 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
           turn.deferredMessage = null;
           if (turn.operationId !== null)
             yield* updateThread({ nativeConversationHeadRef: ref(turn.operationId) });
+          yield* Deferred.succeed(turn.messageReceipt, undefined);
         }
         if (event.type === "trace") {
           if (event.seq <= turn.lastSeq) return;
@@ -593,7 +596,9 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
           if (["message_dropped", "turn_not_running", "agent_not_running"].includes(event.status)) {
             yield* finish(
               turn,
-              "failed",
+              turn.interruptRequested && event.status === "message_dropped"
+                ? "cancelled"
+                : "failed",
               `CodeRabbit Cloud could not deliver this message (${event.status}). Open the cloud task before retrying.`,
             );
             return;
@@ -682,6 +687,7 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
           ) {
             nextArgs = ["resume", turn.taskId, "--message", "-"];
             nextInput = turn.deferredMessage;
+            turn.deferredMessage = null;
             continue;
           }
           if (result._tag === "Failure") {
@@ -958,6 +964,7 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
             input: request,
             providerTurn,
             receipt: yield* Deferred.make<string | null>(),
+            messageReceipt: yield* Deferred.make<void>(),
             wake: yield* Deferred.make<void>(),
             follower: null,
             taskId,
@@ -1079,6 +1086,10 @@ export const makeCodeRabbitCloudAdapterV2 = Effect.fn("makeCodeRabbitCloudAdapte
               turn.awaitingMessageReceipt = false;
             }
           }).pipe(eventPermit.withPermits(1));
+          // A cancel before admission can miss a message still being posted.
+          // Wait until the CLI confirms admission or proves the send was blocked.
+          if (turn.awaitingMessageReceipt) yield* Deferred.await(turn.messageReceipt);
+          if (turn.finished) return;
           const code = yield* command(["cancel", taskId], (event) =>
             Effect.gen(function* () {
               if (event.type === "error") return yield* new CommandError({ operation: "cancel" });

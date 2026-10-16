@@ -635,6 +635,73 @@ it.layer(layer, { excludeTestServices: true })("CodeRabbit Cloud adapter", (it) 
       }).pipe(Effect.scoped),
   );
 
+  it.effect.each(["deferred", "direct"] as const)(
+    "waits for a %s message admission before canceling and requires the matching cloud terminal",
+    (delivery) =>
+      Effect.gen(function* () {
+        const f = yield* fixture(
+          `
+          if(args[1]==='cancel'){
+            if(!existsSync(signal('receipt')))throw new Error('Canceled before message admission');
+            mark('cancelled');emit({phase:'code',type:'complete',status:'cancel_pending',taskId:result.taskId,url:result.url,task:result.task});
+          }else if(args.includes('--answer')){
+            mark('answered');emit({phase:'code',type:'status',status:'answer_sent',message:'sent',taskId:result.taskId,url:result.url,clientOperationId:null});
+            await wait('unused');
+          }else if(args.includes('--message')){
+            if(${delivery === "deferred"}&&!existsSync(signal('blocked'))){mark('blocked');emit(question);process.exitCode=3;}
+            else{
+              emit({phase:'code',type:'trace',taskId:result.taskId,seq:10,createdAt:'2026-10-16',kind:'agent_message',text:'Message admission waiting'});
+              await wait('release-receipt');mark('receipt');
+              emit({phase:'code',type:'status',status:'message_sent',message:'sent',taskId:result.taskId,url:result.url,clientOperationId:'requested-message'});
+              await wait('cloud-terminal');
+              if(!existsSync(signal('cancelled')))throw new Error('Cloud terminal released before cancellation');
+              result.type='error';result.status='turn_canceled';result.message='Canceled';result.turn.outcome='canceled';result.turn.queueItemId='requested-message';emit(result);process.exitCode=1;
+            }
+          }else{result.turn.queueItemId='old-operation';emit(result);}
+        `,
+          "task-123",
+          undefined,
+          false,
+        );
+        yield* f.runtime.startTurn(f.turnInput);
+        const started = yield* f.next((event) => event.type === "provider_turn.updated");
+        if (started.type !== "provider_turn.updated") return;
+        if (delivery === "deferred") {
+          const pending = yield* f.next((event) => event.type === "runtime_request.updated");
+          if (pending.type !== "runtime_request.updated") return;
+          yield* f.runtime.respondToRuntimeRequest({
+            requestId: pending.runtimeRequest.id,
+            answers: { q1: "Option A" },
+          });
+        }
+        yield* f.next(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "Message admission waiting",
+        );
+        const interruption = yield* f.runtime
+          .interruptTurn({
+            providerThread: f.turnInput.providerThread,
+            providerTurnId: started.providerTurn.id,
+          })
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        assert.isUndefined(interruption.pollUnsafe());
+        assert.isFalse(f.allEvents.some((event) => event.type === "turn.terminal"));
+        assert.equal((yield* f.workCalls).filter((entry) => entry.args[1] === "cancel").length, 0);
+        yield* f.mark("release-receipt");
+        yield* Fiber.join(interruption);
+        assert.isFalse(f.allEvents.some((event) => event.type === "turn.terminal"));
+        yield* f.mark("cloud-terminal");
+        const end = yield* f.next((event) => event.type === "turn.terminal");
+        assert.equal(end.type === "turn.terminal" && end.status, "cancelled");
+        const calls = yield* f.workCalls;
+        assert.equal(
+          calls.filter((entry) => entry.args.includes("--message")).length,
+          delivery === "deferred" ? 2 : 1,
+        );
+        assert.equal(calls.filter((entry) => entry.args[1] === "cancel").length, 1);
+      }).pipe(Effect.scoped),
+  );
+
   it.effect.each(["failed", "canceled", "interrupted"] as const)(
     "bounds retries when plain resume repeatedly reports an unrelated %s turn",
     (outcome) =>
