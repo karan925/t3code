@@ -1,4 +1,8 @@
 import {
+  CodeRabbitCloudDriver,
+  type CodeRabbitCloudDriverEnv,
+} from "@t3tools/provider-coderabbit-cloud/server";
+import {
   AcpRegistryDriver,
   type AcpRegistryDriverEnv,
 } from "@t3tools/provider-acp-registry/server";
@@ -16,6 +20,7 @@ import type {
 } from "@t3tools/provider-core/server/driver";
 
 export type BuiltInDriversEnv =
+  | CodeRabbitCloudDriverEnv
   | AcpRegistryDriverEnv
   | AntigravityDriverEnv
   | ClaudeDriverEnv
@@ -36,6 +41,7 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   PiDriver,
   MuseDriver,
   AcpRegistryDriver,
+  CodeRabbitCloudDriver,
 ];
 
 export type BuiltInUsageReadersEnv =

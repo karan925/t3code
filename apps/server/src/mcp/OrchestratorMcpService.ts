@@ -547,12 +547,18 @@ export function resolveRuntimeMode(
       ),
     );
   }
-  return Effect.succeed(
-    supported
-      .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
-      .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0] ??
-      "approval-required",
-  );
+  const compatibleMode = supported
+    .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
+    .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0];
+  if (compatibleMode === undefined) {
+    return Effect.fail(
+      failure(
+        "invalid_request",
+        `Provider ${target?.modelSelection.instanceId} offers no runtime mode within parent mode ${parentMode}. Supported modes: ${supported.join(", ")}.`,
+      ),
+    );
+  }
+  return Effect.succeed(compatibleMode);
 }
 
 export function resolveInteractionMode(

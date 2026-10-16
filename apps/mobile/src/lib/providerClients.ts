@@ -1,3 +1,4 @@
+import { codeRabbitCloudClient } from "@t3tools/provider-coderabbit-cloud/client";
 import { isProviderDriverKind } from "@t3tools/contracts";
 import { acpRegistryClient } from "@t3tools/provider-acp-registry/client";
 import { makeProviderClientRegistry } from "@t3tools/provider-core/client";
@@ -14,6 +15,7 @@ const providerClients = makeProviderClientRegistry([
   openCodeClient,
   piClient,
   acpRegistryClient,
+  codeRabbitCloudClient,
 ]);
 
 export function getProviderClient(driver: string | null | undefined) {

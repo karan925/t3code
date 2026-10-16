@@ -1,3 +1,4 @@
+import { codeRabbitCloudClient } from "@t3tools/provider-coderabbit-cloud/client";
 import {
   AntigravitySettings,
   ClaudeSettings,
@@ -34,4 +35,5 @@ export const providerClients = makeProviderClientRegistry([
   museClient,
   piClient,
   acpRegistryClient,
+  codeRabbitCloudClient,
 ]);

@@ -2157,6 +2157,49 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
     );
 
+    const cloud = {
+      modelSelection: { instanceId: ProviderInstanceId.make("coderabbit-cloud"), model: "default" },
+      supportedRuntimeModes: ["full-access"] as const,
+    };
+
+    it.effect("refuses inherited modes when the provider has no mode within the parent limit", () =>
+      Effect.gen(function* () {
+        for (const parentMode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+          for (const requested of [undefined, "inherit"] as const) {
+            const error = yield* OrchestratorMcpService.resolveRuntimeMode(
+              parentMode,
+              requested,
+              cloud,
+            ).pipe(Effect.flip);
+            assert.equal(error.code, "invalid_request");
+            assert.include(error.message, "coderabbit-cloud");
+            assert.include(error.message, `parent mode ${parentMode}`);
+            assert.include(error.message, "full-access");
+          }
+        }
+      }),
+    );
+
+    it.effect("allows an inherited mode offered within the parent limit", () =>
+      Effect.gen(function* () {
+        assert.equal(
+          yield* OrchestratorMcpService.resolveRuntimeMode("full-access", "inherit", cloud),
+          "full-access",
+        );
+      }),
+    );
+
+    it.effect("never widens the parent limit to meet a provider requirement", () =>
+      Effect.gen(function* () {
+        const error = yield* OrchestratorMcpService.resolveRuntimeMode(
+          "approval-required",
+          "full-access",
+          cloud,
+        ).pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+      }),
+    );
+
     it.effect("steps an inherited mode down to the broadest one the provider offers", () =>
       Effect.gen(function* () {
         assert.equal(

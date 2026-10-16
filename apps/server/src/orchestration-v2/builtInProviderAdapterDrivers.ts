@@ -1,3 +1,7 @@
+import {
+  CodeRabbitCloudAdapterV2Driver,
+  type CodeRabbitCloudAdapterV2DriverEnv,
+} from "@t3tools/provider-coderabbit-cloud/server";
 import type { ProviderDriverKind } from "@t3tools/contracts";
 
 import {
@@ -22,6 +26,7 @@ import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "@t3tools/provider-
 import type { AnyProviderAdapterDriver } from "@t3tools/provider-core/server/adapterDriver";
 
 export type BuiltInProviderAdapterDriversV2Env =
+  | CodeRabbitCloudAdapterV2DriverEnv
   | AcpRegistryAdapterV2DriverEnv
   | ClaudeAdapterV2DriverEnv
   | CodexAdapterV2DriverEnv
@@ -40,6 +45,7 @@ const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
   GrokAdapterV2Driver,
   PiAdapterV2Driver,
   AcpRegistryAdapterV2Driver,
+  CodeRabbitCloudAdapterV2Driver,
 ];
 
 export const BUILT_IN_PROVIDER_ADAPTER_DRIVER_KINDS_V2: ReadonlySet<ProviderDriverKind> = new Set(
