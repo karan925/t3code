@@ -163,6 +163,10 @@ it.effect("preserves pull request context without inheriting any watches", () =>
   Effect.gen(function* () {
     const sourceRun = makeSourceRun("completed");
     const watch = {
+      autofix: false,
+      autofixRounds: 0,
+      autofixGeneration: null,
+      autofixStartedWatch: false,
       startedAt: DateTime.formatIso(sourceCreatedAt),
       headSha: "source-head",
       failedChecks: ["lint"],

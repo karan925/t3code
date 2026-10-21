@@ -34,7 +34,14 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import { evaluatePullRequestWatch, pullRequestWatchMessage } from "./pullRequestWatch.ts";
+import {
+  AUTOFIX_ENDED_TEXT,
+  AUTOFIX_ROUND_LIMIT,
+  evaluatePullRequestWatch,
+  isCodeRabbitReview,
+  pullRequestAutofixMessagePrefix,
+  pullRequestWatchMessage,
+} from "./pullRequestWatch.ts";
 
 /**
  * Checks take minutes, so a faster pass mostly spends the host's rate limit,
@@ -106,6 +113,7 @@ type WatchEndReason =
   | "closed"
   | "unreadable"
   | "comment-limit"
+  | "autofix-limit"
   | "settled"
   | "subagent"
   | "stopped";
@@ -174,7 +182,11 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
     left.remarksThrough === right.remarksThrough &&
     left.remarkIds.join("\n") === right.remarkIds.join("\n") &&
     left.conflicting === right.conflicting &&
-    left.wakes === right.wakes
+    left.wakes === right.wakes &&
+    left.autofix === right.autofix &&
+    left.autofixRounds === right.autofixRounds &&
+    left.autofixGeneration === right.autofixGeneration &&
+    left.autofixStartedWatch === right.autofixStartedWatch
   );
 }
 
@@ -270,6 +282,7 @@ export const make = Effect.gen(function* () {
     next: ThreadPullRequestWatch | null,
     wake?: { readonly text: string; readonly notification: OrchestrationV2Notification },
     endedWatch?: ThreadPullRequestWatch,
+    autofixOnly = false,
   ) {
     const uuid = yield* crypto.randomUUIDv4();
     yield* engine.dispatch({
@@ -278,17 +291,27 @@ export const make = Effect.gen(function* () {
       threadId: target.thread.id,
       ...identityOf(target.link),
       startedAt: target.watch.startedAt,
+      expectedAutofixGeneration: target.watch.autofixGeneration,
       watch: next,
       ...(endedWatch === undefined ? {} : { endedWatch }),
       ...(wake === undefined
         ? {}
-        : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
+        : {
+            wake: {
+              ...wake,
+              messageId: MessageId.make(
+                autofixOnly
+                  ? `${pullRequestAutofixMessagePrefix(target.link)}${uuid}`
+                  : `message:pr-watch:${uuid}`,
+              ),
+            },
+          }),
     });
   });
 
   const giveUp = (target: WatchTarget) =>
     record(target, null, {
-      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. Check it yourself, and call watch_pull_request to watch it again.`,
+      text: `T3 Code stopped watching pull request #${target.link.number} (${target.link.url}) because it failed to read it from the host ${READ_FAILURE_LIMIT} times in a row. ${target.watch.autofix ? AUTOFIX_ENDED_TEXT : "Check it yourself, and call watch_pull_request to watch it again."}`,
       notification: {
         source: { kind: "monitor" },
         outcome: "failed",
@@ -391,7 +414,7 @@ export const make = Effect.gen(function* () {
 
   const closed = (target: WatchTarget) =>
     record(target, null, {
-      text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. Call watch_pull_request if it reopens.`,
+      text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. ${target.watch.autofix ? AUTOFIX_ENDED_TEXT : "Call watch_pull_request if it reopens."}`,
       notification: {
         source: { kind: "monitor" },
         outcome: "updated",
@@ -548,14 +571,29 @@ export const make = Effect.gen(function* () {
           headSha: report.next.headSha,
           report,
         });
-        // An ending watch keeps what this pass saw, so watching again starts from it.
-        return (
-          report.exhausted
-            ? record(target, null, wake, report.next)
-            : record(target, report.next, wake)
+        return record(
+          target,
+          report.exhausted ? null : report.next,
+          wake,
+          // An ending watch keeps what this pass saw, so watching again starts from it.
+          report.exhausted ? report.next : undefined,
+          // Mixed updates must survive turning Autofix off, which cancels only Autofix wakes.
+          report.autofix &&
+            report.changes.every(
+              (change) => change.kind === "remarks" && change.remarks.every(isCodeRabbitReview),
+            ),
         ).pipe(
           Effect.tap(() => woke(target)),
-          Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
+          Effect.tap(() =>
+            report.exhausted
+              ? ended(
+                  target,
+                  report.autofix && report.next.autofixRounds >= AUTOFIX_ROUND_LIMIT
+                    ? "autofix-limit"
+                    : "comment-limit",
+                )
+              : Effect.void,
+          ),
         );
       }
       return watchesEqual(report.next, target.watch) ? Effect.void : record(target, report.next);

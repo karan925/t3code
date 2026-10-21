@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  CommandId,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -95,6 +96,14 @@ export const ThreadPullRequestWatch = Schema.Struct({
   conflicting: Schema.Boolean,
   /** Comment-only wakes in a row. Watching stops at a limit, so bots cannot loop it. */
   wakes: NonNegativeInt,
+  /** CodeRabbit reviews wake the agent to fix them with the CodeRabbit autofix skill. */
+  autofix: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  autofixRounds: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  /** A new enable command invalidates host reads from the previous Autofix session. */
+  autofixGeneration: Schema.NullOr(CommandId).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  autofixStartedWatch: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ThreadPullRequestWatch = typeof ThreadPullRequestWatch.Type;
 

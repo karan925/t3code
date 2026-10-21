@@ -1,16 +1,20 @@
-import type {
-  OrchestrationV2Notification,
-  PullRequestCheck,
-  PullRequestComment,
-  PullRequestDetail,
-  ThreadPullRequestWatch,
+import {
+  CODERABBIT_AUTOFIX_SKILL,
+  type OrchestrationV2Notification,
+  type PullRequestCheck,
+  type PullRequestComment,
+  type PullRequestDetail,
+  type ThreadPullRequestWatch,
+  type ThreadPullRequestKey,
 } from "@t3tools/contracts";
+import { threadPullRequestKeyOf } from "@t3tools/shared/threadPullRequests";
 
 /**
  * Wakes in a row that bring only comments. Check, conflict, or push news resets the count, so
  * this only stops a chatty bot looping an agent that is replying to it.
  */
 export const PULL_REQUEST_WATCH_WAKE_LIMIT = 10;
+export const AUTOFIX_ROUND_LIMIT = 5;
 const LISTED_ITEMS = 10;
 const SNIPPET_LENGTH = 200;
 
@@ -24,6 +28,7 @@ export interface PullRequestWatchReport {
   readonly changes: ReadonlyArray<PullRequestWatchChange>;
   readonly next: ThreadPullRequestWatch;
   readonly exhausted: boolean;
+  readonly autofix: boolean;
 }
 
 // "action-required" is a finished check that needs someone, so the agent hears about it.
@@ -94,8 +99,14 @@ export function evaluatePullRequestWatch(
   const commentsOnly = changes.length > 0 && changes.every((change) => change.kind === "remarks");
   const progress = headMoved || (changes.length > 0 && !commentsOnly);
   const wakes = (progress ? 0 : watch.wakes) + (commentsOnly ? 1 : 0);
+  const autofix =
+    watch.autofix &&
+    watch.autofixRounds < AUTOFIX_ROUND_LIMIT &&
+    fresh.some((remark) => Date.parse(remark.createdAt) > through && isCodeRabbitReview(remark));
+  const autofixRounds = watch.autofixRounds + (autofix ? 1 : 0);
   return {
     changes,
+    autofix,
     next: {
       startedAt: watch.startedAt,
       headSha,
@@ -106,8 +117,14 @@ export function evaluatePullRequestWatch(
       remarkIds,
       conflicting,
       wakes,
+      autofix: watch.autofix && autofixRounds < AUTOFIX_ROUND_LIMIT,
+      autofixRounds,
+      autofixGeneration: watch.autofixGeneration,
+      autofixStartedWatch: watch.autofixStartedWatch,
     },
-    exhausted: commentsOnly && wakes >= PULL_REQUEST_WATCH_WAKE_LIMIT,
+    exhausted:
+      (commentsOnly && wakes >= PULL_REQUEST_WATCH_WAKE_LIMIT) ||
+      (autofix && autofixRounds >= AUTOFIX_ROUND_LIMIT && watch.autofixStartedWatch),
   };
 }
 
@@ -165,6 +182,44 @@ const SUMMARY: Record<PullRequestWatchChange["kind"], string> = {
   conflicting: "merge conflict",
 };
 
+const CODERABBIT_LOGINS = new Set(["coderabbitai", "coderabbitai[bot]", "coderabbit[bot]"]);
+
+export const isCodeRabbitReview = (remark: PullRequestComment) =>
+  CODERABBIT_LOGINS.has(remark.author?.login.toLowerCase() ?? "") &&
+  (remark.kind === "review" ||
+    remark.kind === "review-comment" ||
+    remark.path !== null ||
+    remark.reviewState !== null);
+
+export const AUTOFIX_ENDED_TEXT =
+  "Autofix ended. The user can turn it back on in the thread panel.";
+
+export const pullRequestAutofixMessagePrefix = (key: ThreadPullRequestKey) =>
+  `message:pr-autofix:${threadPullRequestKeyOf(key)}:`;
+
+export function pullRequestAutofixMessage(input: {
+  readonly number: number;
+  readonly url: string;
+  readonly autofixRounds: number;
+  readonly stopped?: boolean;
+}): { readonly text: string; readonly notification: OrchestrationV2Notification } {
+  return {
+    text: [
+      `$${CODERABBIT_AUTOFIX_SKILL} The user turned on CodeRabbit Autofix for pull request #${input.number} (${input.url}). Use the CodeRabbit autofix skill to fix CodeRabbit's unresolved review threads on this pull request. That setting is the user's approval to apply each fix you verify against the code yourself, commit the fixes together, and push, without asking for each one. Skip reviewer suggestions you judge wrong, and say why.`,
+      input.autofixRounds >= AUTOFIX_ROUND_LIMIT
+        ? `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds. The user can turn it on again in the thread panel.`
+        : input.stopped
+          ? AUTOFIX_ENDED_TEXT
+          : "T3 Code keeps watching for CodeRabbit reviews, so end your turn when you are done and do not call unwatch_pull_request.",
+    ].join("\n\n"),
+    notification: {
+      source: { kind: "monitor" },
+      outcome: "updated",
+      summary: `#${input.number}: CodeRabbit Autofix${input.autofixRounds >= AUTOFIX_ROUND_LIMIT ? ` ended after ${AUTOFIX_ROUND_LIMIT} rounds` : " requested"}`,
+    },
+  };
+}
+
 export function pullRequestWatchMessage(input: {
   readonly number: number;
   readonly url: string;
@@ -172,7 +227,7 @@ export function pullRequestWatchMessage(input: {
   readonly headSha: string | null;
   readonly report: PullRequestWatchReport;
 }): { readonly text: string; readonly notification: OrchestrationV2Notification } {
-  const { changes, exhausted } = input.report;
+  const { changes, exhausted, autofix } = input.report;
   const context = {
     baseBranch: input.baseBranch,
     commit: input.headSha === null ? "" : ` on ${input.headSha.slice(0, 7)}`,
@@ -181,14 +236,33 @@ export function pullRequestWatchMessage(input: {
     `Update on pull request #${input.number} (${input.url}), which T3 Code is watching for you:`,
     ...changes.flatMap((change) => changeLines(change, context)),
     "",
+    ...(autofix
+      ? [
+          pullRequestAutofixMessage({
+            ...input,
+            autofixRounds: input.report.next.autofixRounds,
+            stopped: exhausted,
+          }).text,
+          "",
+        ]
+      : []),
     exhausted
-      ? `T3 Code stopped watching after ${PULL_REQUEST_WATCH_WAKE_LIMIT} comment-only updates in a row. Call watch_pull_request to watch it again.`
-      : "Look into each item and act on it as your task requires. T3 Code keeps watching and wakes you on the next change, so end your turn when you are done. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox.",
+      ? autofix && input.report.next.autofixRounds >= AUTOFIX_ROUND_LIMIT
+        ? "T3 Code stopped watching."
+        : `T3 Code stopped watching after ${PULL_REQUEST_WATCH_WAKE_LIMIT} comment-only updates in a row.${autofix ? "" : ` ${input.report.next.autofix ? AUTOFIX_ENDED_TEXT : "Call watch_pull_request to watch it again."}`}`
+      : autofix
+        ? ""
+        : input.report.next.autofix
+          ? "Look into each item and act on it as your task requires. T3 Code keeps watching for CodeRabbit reviews, so end your turn when you are done and do not call unwatch_pull_request."
+          : "Look into each item and act on it as your task requires. T3 Code keeps watching and wakes you on the next change, so end your turn when you are done. When you hand the work back to the user, call unwatch_pull_request first so the thread returns to their inbox.",
   ].join("\n");
   const failed = changes.some(
     (change) => change.kind === "checks-failed" || change.kind === "conflicting",
   );
   const summary = changes.map((change) => SUMMARY[change.kind]);
+  if (autofix && input.report.next.autofixRounds >= AUTOFIX_ROUND_LIMIT) {
+    summary.push(`Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`);
+  }
   if (exhausted) summary.push("stopped watching");
   return {
     text,

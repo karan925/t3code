@@ -32,5 +32,9 @@ it.effect("decodes a watch saved before passed checks were recorded", () =>
     ]);
 
     assert.deepStrictEqual(link?.watch?.passedChecks, []);
+    assert.isFalse(link?.watch?.autofix);
+    assert.equal(link?.watch?.autofixRounds, 0);
+    assert.isNull(link?.watch?.autofixGeneration);
+    assert.isFalse(link?.watch?.autofixStartedWatch);
   }),
 );

@@ -152,6 +152,7 @@ it.effect("a persisted fork leaves PR watching with its parent until explicitly 
         threadId: targetThreadId,
         ...key,
         startedAt: parentWatch.startedAt,
+        expectedAutofixGeneration: parentWatch.autofixGeneration,
         watch: parentWatch,
         wake: {
           messageId: MessageId.make("fork-watch-unwanted-wake"),

@@ -331,6 +331,7 @@ import {
   ProviderConsumeResetCreditResult,
 } from "./providerUsageLimits.ts";
 import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
+import { CodeRabbitError, CodeRabbitStatus } from "./codeRabbit.ts";
 import {
   StorageCleanupReport,
   DatabaseStorageStatus,
@@ -485,6 +486,8 @@ export const WS_METHODS = {
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
   serverDiscoverSourceControl: "server.discoverSourceControl",
+  serverGetCodeRabbitStatus: "server.getCodeRabbitStatus",
+  serverInstallCodeRabbitSkills: "server.installCodeRabbitSkills",
   serverSearchAcpRegistry: "server.searchAcpRegistry",
   serverPrepareAcpRegistryAgent: "server.prepareAcpRegistryAgent",
   serverUninstallAcpRegistryManagedBinary: "server.uninstallAcpRegistryManagedBinary",
@@ -774,6 +777,17 @@ const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourc
   payload: Schema.Struct({}),
   success: SourceControlDiscoveryResult,
   error: EnvironmentAuthorizationError,
+});
+
+const WsServerGetCodeRabbitStatusRpc = Rpc.make(WS_METHODS.serverGetCodeRabbitStatus, {
+  payload: Schema.Struct({}),
+  success: CodeRabbitStatus,
+  error: EnvironmentAuthorizationError,
+});
+
+const WsServerInstallCodeRabbitSkillsRpc = Rpc.make(WS_METHODS.serverInstallCodeRabbitSkills, {
+  payload: Schema.Struct({}),
+  error: Schema.Union([CodeRabbitError, EnvironmentAuthorizationError]),
 });
 
 const WsServerSearchAcpRegistryRpc = Rpc.make(WS_METHODS.serverSearchAcpRegistry, {
@@ -1910,6 +1924,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
   WsServerDiscoverSourceControlRpc,
+  WsServerGetCodeRabbitStatusRpc,
+  WsServerInstallCodeRabbitSkillsRpc,
   WsServerSearchAcpRegistryRpc,
   WsServerPrepareAcpRegistryAgentRpc,
   WsServerUninstallAcpRegistryManagedBinaryRpc,

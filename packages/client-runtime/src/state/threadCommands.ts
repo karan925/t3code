@@ -407,9 +407,20 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
   };
   const optimistic = createOptimisticThreadLifecycle(snapshotAtom);
+  const updateMetadata = optimistic.wrap(commands.updateMetadata, (thread, input) => ({
+    ...thread,
+    codeRabbitReview: input.codeRabbitReview,
+  }));
   return {
     ...commands,
     snapshotAtom: optimistic.snapshotAtom,
+    updateMetadata: {
+      ...commands.updateMetadata,
+      run: (registry, target) =>
+        target.input.codeRabbitReview === undefined
+          ? commands.updateMetadata.run(registry, target)
+          : updateMetadata.run(registry, target),
+    } satisfies typeof commands.updateMetadata,
     settle: optimistic.wrap(commands.settle, (thread, _input, now, accepted) =>
       !accepted &&
       (thread.pendingRuntimeRequest !== null ||

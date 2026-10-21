@@ -5473,6 +5473,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         {
           ...link,
           watch: {
+            autofix: false,
+            autofixRounds: 0,
+            autofixGeneration: null,
+            autofixStartedWatch: false,
             startedAt: DateTime.formatIso(at),
             headSha: null,
             failedChecks: [],

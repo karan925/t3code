@@ -349,6 +349,10 @@ describe("derivePendingBackgroundWork kinds", () => {
 
   describe("pull request watches", () => {
     const watch = {
+      autofix: false,
+      autofixRounds: 0,
+      autofixGeneration: null,
+      autofixStartedWatch: false,
       startedAt: "2026-10-05T00:00:00.000Z",
       headSha: null,
       failedChecks: [],

@@ -14,6 +14,10 @@ describe("Forgejo comment watch boundary", () => {
   const createdAt = "2026-10-10T19:52:40Z";
   const editedAt = "2026-10-10T20:04:50Z";
   const seen = {
+    autofix: false,
+    autofixRounds: 0,
+    autofixGeneration: null,
+    autofixStartedWatch: false,
     startedAt: "2026-10-02T12:00:00.000Z",
     headSha: "aaaaaaaaaa",
     failedChecks: [],

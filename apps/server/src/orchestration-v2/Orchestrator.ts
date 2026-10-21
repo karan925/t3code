@@ -81,6 +81,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
+import { pullRequestAutofixMessage, pullRequestAutofixMessagePrefix } from "./pullRequestWatch.ts";
 import {
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
@@ -567,6 +568,26 @@ function withPullRequestWatch(
   if (watch !== undefined) return { ...rest, watch };
   const ended = previous ?? endedWatch;
   return ended === undefined ? rest : { ...rest, endedWatch: ended };
+}
+
+// Keeps the same object when nothing changes, so a repeated watch call is a no-op.
+function withWatchAutofix(
+  watch: ThreadPullRequestWatch,
+  autofix: boolean | undefined,
+  commandId: CommandId,
+): ThreadPullRequestWatch | undefined {
+  if (autofix === false && watch.autofixStartedWatch) return undefined;
+  if (autofix === undefined) {
+    return watch.autofixStartedWatch ? { ...watch, autofixStartedWatch: false } : watch;
+  }
+  return autofix === watch.autofix
+    ? watch
+    : {
+        ...watch,
+        autofix,
+        autofixGeneration: commandId,
+        ...(autofix ? { autofixRounds: 1 } : {}),
+      };
 }
 
 function legacyPullRequestLink(
@@ -2558,11 +2579,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         thread.settledOverride === "settled" ||
         thread.settledAt !== null ||
         isProviderNativeSubagentThread(thread);
-      if (link?.watch?.startedAt !== command.startedAt || (command.wake && inactive)) {
+      if (
+        link?.watch?.startedAt !== command.startedAt ||
+        command.expectedAutofixGeneration !== link.watch.autofixGeneration ||
+        (command.wake && inactive)
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: "The pull request watch ended or its thread settled while it was read.",
+          cause: "The pull request watch changed or its thread settled while it was read.",
         });
       }
       yield* dispatchThreadMutation(command, events, effects);
@@ -2575,6 +2600,74 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageId: command.wake.messageId,
           text: command.wake.text,
           notification: command.wake.notification,
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+        },
+        events,
+        effects,
+      );
+    },
+  );
+
+  const dispatchPullRequestWatch = Effect.fn("orchestrationV2.dispatch.pullRequestWatch")(
+    function* (
+      command: Extract<
+        OrchestrationV2ServerCommand,
+        { readonly type: "thread.pull-request.watch" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const thread = yield* projectionStore
+        .getThread(command.threadId)
+        .pipe(mapDispatchError(command));
+      const link = threadPullRequestsOf(thread).find(
+        (candidate) =>
+          candidate.source !== "stack-dismissed" && threadPullRequestKeysEqual(candidate, command),
+      );
+      yield* dispatchThreadMutation(command, events, effects);
+      if (!command.watching || command.autofix === false) {
+        const { runs } = yield* projectionStore
+          .getThreadRecords(command.threadId, ["runs"])
+          .pipe(mapDispatchError(command));
+        const queued = runs.filter((run) => run.status === "queued");
+        if (queued.length === 0) return;
+        const runIds = queued.map((run) => run.id);
+        const projection = yield* projectionStore
+          .getThreadRecords(command.threadId, ["messages", "nodes", "attempts"], {
+            messageRoles: ["user"],
+            messageRunIds: runIds,
+            runIds,
+          })
+          .pipe(mapDispatchError(command));
+        const prefix = pullRequestAutofixMessagePrefix(command);
+        const pending = new Set(
+          projection.messages
+            .filter((message) => message.id.startsWith(prefix))
+            .map((message) => message.id),
+        );
+        const now = yield* DateTime.now;
+        for (const run of queued) {
+          if (!pending.has(run.userMessageId)) continue;
+          yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+        }
+        return;
+      }
+      if (command.autofix !== true || link?.watch?.autofix) return;
+      const url = link?.url ?? command.link?.url;
+      if (url === undefined) return;
+      const wake = pullRequestAutofixMessage({ number: command.number, url, autofixRounds: 1 });
+      yield* dispatchMessage(
+        {
+          type: "message.dispatch",
+          commandId: command.commandId,
+          threadId: command.threadId,
+          messageId: MessageId.make(
+            `${pullRequestAutofixMessagePrefix(command)}${command.commandId}`,
+          ),
+          ...wake,
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: "agent",
@@ -2639,6 +2732,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
+      command.autofix !== false &&
       isProviderNativeSubagentThread(thread)
     ) {
       return yield* new OrchestratorSubagentThreadReadOnlyError({
@@ -2649,6 +2743,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
+      command.autofix !== false &&
       (thread.settledOverride === "settled" ||
         thread.settledAt !== null ||
         thread.archivedAt !== null)
@@ -2664,6 +2759,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
+      command.autofix !== false &&
       thread.lineage.relationshipToParent === "subagent"
     ) {
       return yield* new OrchestratorDispatchError({
@@ -3177,6 +3273,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 : {}),
             ...(command.branch === undefined ? {} : { branch: command.branch }),
             ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
+            ...(command.codeRabbitReview === undefined
+              ? {}
+              : { codeRabbitReview: command.codeRabbitReview }),
             ...(command.linkedPullRequest === undefined
               ? {}
               : {
@@ -3351,29 +3450,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const watch =
             command.type === "thread.pull-request-watch.sync"
               ? existing.watch?.startedAt === command.startedAt
-                ? (command.watch ?? undefined)
+                ? command.watch == null
+                  ? undefined
+                  : {
+                      ...command.watch,
+                      autofixGeneration:
+                        command.watch.autofix === existing.watch.autofix
+                          ? existing.watch.autofixGeneration
+                          : command.commandId,
+                      autofixStartedWatch: existing.watch.autofixStartedWatch,
+                    }
                 : existing.watch
-              : !command.watching
+              : !command.watching || (command.autofix === false && existing.watch === undefined)
                 ? undefined
-                : (existing.watch ?? {
-                    startedAt,
-                    headSha: null,
-                    failedChecks: [],
-                    passed: false,
-                    passedChecks: [],
-                    conflicting: false,
-                    // Watching again must not repeat check or conflict news the last watch told.
-                    ...(existing.endedWatch && {
-                      headSha: existing.endedWatch.headSha,
-                      failedChecks: existing.endedWatch.failedChecks,
-                      passed: existing.endedWatch.passed,
-                      passedChecks: existing.endedWatch.passedChecks,
-                      conflicting: existing.endedWatch.conflicting,
-                    }),
-                    remarksThrough: startedAt,
-                    remarkIds: [],
-                    wakes: 0,
-                  });
+                : withWatchAutofix(
+                    existing.watch ?? {
+                      startedAt,
+                      headSha: null,
+                      failedChecks: [],
+                      passed: false,
+                      passedChecks: [],
+                      remarksThrough: startedAt,
+                      remarkIds: [],
+                      conflicting: false,
+                      // Watching again must not repeat check or conflict news the last watch told.
+                      ...(existing.endedWatch && {
+                        headSha: existing.endedWatch.headSha,
+                        failedChecks: existing.endedWatch.failedChecks,
+                        passed: existing.endedWatch.passed,
+                        passedChecks: existing.endedWatch.passedChecks,
+                        conflicting: existing.endedWatch.conflicting,
+                      }),
+                      wakes: 0,
+                      autofix: command.autofix === true,
+                      autofixRounds: command.autofix === true ? 1 : 0,
+                      autofixGeneration: command.autofix === true ? command.commandId : null,
+                      autofixStartedWatch: command.autofix === true,
+                    },
+                    command.autofix,
+                    command.commandId,
+                  );
           if (watch === existing.watch && links === linked) return thread;
           const final =
             command.type === "thread.pull-request-watch.sync" && watch === undefined
@@ -11269,7 +11385,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.pull-request.link":
       case "thread.pull-request.unlink":
       case "thread.pull-request-link.sync":
-      case "thread.pull-request.watch":
       case "thread.pull-request.sync":
       case "thread.title.regeneration.complete":
       case "thread.runtime-mode.set":
@@ -11277,6 +11392,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.model-selection.set":
       case "provider.switch":
         yield* dispatchThreadMutation(command, events, effects);
+        break;
+      case "thread.pull-request.watch":
+        yield* dispatchPullRequestWatch(command, events, effects);
         break;
       case "thread.pull-request-watch.sync":
         yield* dispatchPullRequestWatchSync(command, events, effects);

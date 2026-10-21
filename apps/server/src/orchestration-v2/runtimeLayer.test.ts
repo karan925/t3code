@@ -59,6 +59,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "./Orchestrator.ts";
+import { AUTOFIX_ROUND_LIMIT } from "./pullRequestWatch.ts";
 import { ROLLBACK_FAILED_MESSAGE } from "./CheckpointRollbackService.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -2210,6 +2211,581 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect.each(["new", "existing", "active"] as const)(
+    "enabling Autofix immediately dispatches one server wake (%s watch)",
+    (mode) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const threadId = ThreadId.make(`runtime-autofix-enable-${mode}`);
+        yield* seedProject({
+          projectId: ProjectId.make(`autofix-enable-project-${mode}`),
+          title: "Autofix",
+          workspaceRoot: "/workspace/autofix",
+          defaultModelSelection: null,
+          createdAt: "2026-10-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`autofix-enable-create-${mode}`),
+          threadId,
+          projectId: ProjectId.make(`autofix-enable-project-${mode}`),
+          title: "Autofix",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const key = { host: "github.com", repository: "pingdotgg/t3code", number: 7 };
+        const link = {
+          url: "https://github.com/pingdotgg/t3code/pull/7",
+          source: "manual" as const,
+        };
+        if (mode === "existing") {
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`autofix-enable-plain-${mode}`),
+            threadId,
+            ...key,
+            watching: true,
+            link,
+          });
+        }
+        if (mode === "active") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`autofix-enable-user-${mode}`),
+            threadId,
+            messageId: MessageId.make(`autofix-enable-user-${mode}`),
+            text: "Keep working",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+        }
+        const command = {
+          type: "thread.pull-request.watch" as const,
+          commandId: CommandId.make(`autofix-enable-${mode}`),
+          threadId,
+          ...key,
+          watching: true,
+          autofix: true,
+          link,
+        };
+        yield* orchestrator.dispatch(command);
+        yield* orchestrator.dispatch(command);
+        yield* orchestrator.dispatch({
+          ...command,
+          commandId: CommandId.make(`autofix-enable-repeat-${mode}`),
+        });
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const wakes = projection.messages.filter((message) => message.text.includes("$autofix "));
+        assert.lengthOf(wakes, 1);
+        assert.equal(
+          wakes[0]?.id,
+          `message:pr-autofix:github.com/pingdotgg/t3code#7:${command.commandId}`,
+        );
+        assert.equal(wakes[0]?.createdBy, "agent");
+        assert.equal(wakes[0]?.creationSource, "server");
+        assert.include(wakes[0]?.notification?.summary ?? "", "CodeRabbit Autofix");
+        assert.include(wakes[0]?.text ?? "", "do not call unwatch_pull_request");
+        const wakeRun = projection.runs.find((run) => run.userMessageId === wakes[0]?.id);
+        assert.isDefined(wakeRun);
+        assert.equal(wakeRun?.status, mode === "active" ? "queued" : "starting");
+        const watch = projection.thread.pullRequests?.[0]?.watch;
+        assert.equal(watch?.autofixRounds, 1);
+        assert.equal(watch?.autofixStartedWatch, mode !== "existing");
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).messages.filter((message) =>
+            message.text.includes("$autofix "),
+          ).length,
+          1,
+        );
+        if (mode === "active" && watch) {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("autofix-keep-user-queue"),
+            threadId,
+            messageId: MessageId.make("autofix-user-queue"),
+            createdBy: "user",
+            creationSource: "web",
+            text: "$autofix Check another PR",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+          });
+          yield* orchestrator.dispatch({
+            ...command,
+            number: 8,
+            commandId: CommandId.make("autofix-other-pr"),
+            link: { ...link, url: "https://github.com/pingdotgg/t3code/pull/8" },
+          });
+          const reviewMessageId = MessageId.make(
+            "message:pr-autofix:github.com/pingdotgg/t3code#7:review",
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.pull-request-watch.sync",
+            commandId: CommandId.make("autofix-queued-review"),
+            threadId,
+            ...key,
+            startedAt: watch.startedAt,
+            expectedAutofixGeneration: watch.autofixGeneration,
+            watch: { ...watch, autofixRounds: 2 },
+            wake: {
+              messageId: reviewMessageId,
+              text: "$autofix Fix the new review",
+              notification: {
+                source: { kind: "monitor" },
+                outcome: "updated",
+                summary: "New review",
+              },
+            },
+          });
+          yield* orchestrator.dispatch({
+            ...command,
+            commandId: CommandId.make("autofix-disable-queued"),
+            autofix: false,
+          });
+          const stopped = yield* orchestrator.getThreadProjection(threadId);
+          const statusOf = (messageId: string) =>
+            stopped.runs.find((run) => run.userMessageId === messageId)?.status;
+          assert.equal(statusOf(wakes[0]!.id), "cancelled");
+          assert.equal(statusOf(reviewMessageId), "cancelled");
+          assert.equal(statusOf("autofix-user-queue"), "queued");
+          assert.equal(
+            statusOf("message:pr-autofix:github.com/pingdotgg/t3code#8:autofix-other-pr"),
+            "queued",
+          );
+          assert.isUndefined(stopped.thread.pullRequests?.find((pr) => pr.number === 7)?.watch);
+          assert.isTrue(stopped.thread.pullRequests?.find((pr) => pr.number === 8)?.watch?.autofix);
+        }
+      }),
+  );
+
+  it.effect.each(["autofix", "independent", "claimed"] as const)(
+    "turning Autofix off preserves only independently requested watches (%s)",
+    (mode) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threadId = ThreadId.make(`runtime-autofix-owner-${mode}`);
+        yield* seedProject({
+          projectId: ProjectId.make(`autofix-owner-project-${mode}`),
+          title: "Autofix",
+          workspaceRoot: "/workspace/autofix",
+          defaultModelSelection: null,
+          createdAt: "2026-10-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`autofix-owner-create-${mode}`),
+          threadId,
+          projectId: ProjectId.make(`autofix-owner-project-${mode}`),
+          title: "Autofix",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const key = { host: "github.com", repository: "pingdotgg/t3code", number: 7 };
+        const watchOf = Effect.map(
+          orchestrator.getThreadShell(threadId),
+          (thread) => thread?.pullRequests?.[0]?.watch,
+        );
+        const watching = {
+          type: "thread.pull-request.watch" as const,
+          threadId,
+          ...key,
+          watching: true,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/7", source: "manual" as const },
+        };
+        if (mode === "independent")
+          yield* orchestrator.dispatch({
+            ...watching,
+            commandId: CommandId.make(`autofix-owner-plain-${mode}`),
+          });
+        yield* orchestrator.dispatch({
+          ...watching,
+          commandId: CommandId.make(`autofix-owner-enable-${mode}`),
+          autofix: true,
+        });
+        if (mode === "claimed")
+          yield* orchestrator.dispatch({
+            ...watching,
+            commandId: CommandId.make(`autofix-owner-claim-${mode}`),
+          });
+        const before = yield* watchOf;
+        assert.isDefined(before);
+        assert.equal(before?.autofixStartedWatch, mode === "autofix");
+        yield* orchestrator.dispatch({
+          ...watching,
+          commandId: CommandId.make(`autofix-owner-disable-${mode}`),
+          autofix: false,
+        });
+        const after = yield* watchOf;
+        if (mode === "autofix") assert.isUndefined(after);
+        else
+          assert.deepEqual(after, {
+            ...before,
+            autofix: false,
+            autofixGeneration: CommandId.make(`autofix-owner-disable-${mode}`),
+          });
+        if (after) {
+          yield* orchestrator.dispatch({
+            ...watching,
+            commandId: CommandId.make(`autofix-owner-reenable-${mode}`),
+            autofix: true,
+          });
+          assert.equal((yield* watchOf)?.autofixRounds, 1);
+          assert.isTrue((yield* watchOf)?.autofix);
+          assert.notEqual((yield* watchOf)?.autofixGeneration, before?.autofixGeneration);
+          if (before) {
+            const stale = yield* orchestrator
+              .dispatch({
+                type: "thread.pull-request-watch.sync",
+                commandId: CommandId.make(`autofix-owner-stale-${mode}`),
+                threadId,
+                ...key,
+                startedAt: before.startedAt,
+                expectedAutofixGeneration: before.autofixGeneration,
+                watch: { ...before, autofixRounds: 2 },
+                wake: {
+                  messageId: MessageId.make(`autofix-owner-stale-${mode}`),
+                  text: "$autofix Stale review",
+                  notification: {
+                    source: { kind: "monitor" },
+                    outcome: "updated",
+                    summary: "Stale review",
+                  },
+                },
+              })
+              .pipe(Effect.flip);
+            assert.equal(stale._tag, "OrchestratorDispatchError");
+            assert.equal((yield* watchOf)?.autofixRounds, 1);
+            assert.isFalse(
+              (yield* orchestrator.getThreadProjection(threadId)).messages.some(
+                (message) => message.id === `autofix-owner-stale-${mode}`,
+              ),
+            );
+          }
+        }
+      }),
+  );
+
+  it.effect.each([
+    { independent: false, news: "coderabbit" },
+    { independent: true, news: "coderabbit" },
+    { independent: false, news: "checks" },
+    { independent: false, news: "human" },
+  ] as const)(
+    "finishes the fifth Autofix round and preserves mixed queued news (%j)",
+    ({ independent, news }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const suffix = `${independent}-${news}`;
+        const threadId = ThreadId.make(`runtime-autofix-round-limit-${suffix}`);
+        const projectId = ProjectId.make(`autofix-limit-project-${suffix}`);
+        yield* seedProject({
+          projectId,
+          title: "Autofix",
+          workspaceRoot: "/workspace/autofix",
+          defaultModelSelection: null,
+          createdAt: "2026-10-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`autofix-limit-create-${suffix}`),
+          threadId,
+          projectId,
+          title: "Autofix",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`autofix-limit-active-${suffix}`),
+          threadId,
+          messageId: MessageId.make(`autofix-limit-active-${suffix}`),
+          text: "Keep working",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        const watching = {
+          type: "thread.pull-request.watch" as const,
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 7,
+          watching: true,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/7", source: "manual" as const },
+        };
+        if (independent)
+          yield* orchestrator.dispatch({
+            ...watching,
+            commandId: CommandId.make(`autofix-limit-watch-${suffix}`),
+          });
+        yield* orchestrator.dispatch({
+          ...watching,
+          commandId: CommandId.make(`autofix-limit-enable-${suffix}`),
+          autofix: true,
+        });
+        const started = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
+        assert.isDefined(started);
+        if (!started) return;
+        const sync = {
+          type: "thread.pull-request-watch.sync" as const,
+          commandId: CommandId.make(`autofix-limit-sync-${suffix}`),
+          threadId,
+          host: watching.host,
+          repository: watching.repository,
+          number: watching.number,
+          startedAt: started.startedAt,
+          expectedAutofixGeneration: started.autofixGeneration,
+          watch: { ...started, headSha: "abc1234def", autofixRounds: AUTOFIX_ROUND_LIMIT - 1 },
+        };
+        yield* orchestrator.dispatch(sync);
+        const remark: PullRequestComment = {
+          id: "review",
+          kind: "review-comment",
+          author: { login: "coderabbitai[bot]", name: null, avatarUrl: null },
+          body: "Please fix this",
+          createdAt: "2999-01-01T00:00:01.000Z",
+          url: null,
+          path: "src/index.ts",
+          reviewState: null,
+        };
+        const detail = watchedPullRequestDetail({ projectId, number: 7, at: started.startedAt });
+        const reactor = yield* PullRequestWatchReactor.make.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              NodeServices.layer,
+              Layer.mock(PullRequestService.PullRequestService)({
+                detail: () =>
+                  Effect.succeed({ ...detail, checks: news === "checks" ? detail.checks : [] }),
+                activity: () =>
+                  Effect.succeed({
+                    comments:
+                      news === "human"
+                        ? [
+                            remark,
+                            {
+                              ...remark,
+                              id: "human",
+                              author: { ...remark.author!, login: "reviewer" },
+                            },
+                          ]
+                        : [remark],
+                    commentCount: news === "human" ? 2 : 1,
+                    commentsTruncated: false,
+                    reviewThreads: [],
+                    commits: [],
+                  }),
+              }),
+            ),
+          ),
+        );
+        yield* reactor.sweep;
+        const watch = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
+        if (independent) {
+          assert.isFalse(watch?.autofix);
+          assert.equal(watch?.autofixRounds, AUTOFIX_ROUND_LIMIT);
+        } else assert.isUndefined(watch);
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const wake = projection.messages.find((message) =>
+          message.notification?.summary.includes(
+            `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`,
+          ),
+        )!;
+        assert.isDefined(wake);
+        assert.include(wake.text, "$autofix ");
+        assert.include(wake.text, `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`);
+        assert.include(wake.text, "turn it on again in the thread panel");
+        assert.equal(wake.text.includes("T3 Code stopped watching."), !independent);
+        assert.equal(
+          projection.runs.find((run) => run.userMessageId === wake.id)?.status,
+          "queued",
+        );
+        const rejected = yield* orchestrator
+          .dispatch({ ...sync, commandId: CommandId.make(`autofix-limit-stale-${suffix}`) })
+          .pipe(Effect.flip);
+        assert.equal(rejected._tag, "OrchestratorDispatchError");
+        yield* orchestrator.dispatch({
+          ...watching,
+          commandId: CommandId.make(`autofix-limit-disable-${suffix}`),
+          autofix: false,
+        });
+        const stopped = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          stopped.runs.find((run) => run.userMessageId === wake.id)?.status,
+          news === "coderabbit" ? "cancelled" : "queued",
+        );
+        yield* orchestrator.dispatch({
+          ...watching,
+          commandId: CommandId.make(`autofix-limit-reenable-${suffix}`),
+          autofix: true,
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch?.autofixRounds,
+          1,
+        );
+      }),
+  );
+
+  it.effect("preserves autofix across repeated watches and stale host reads", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const threadId = ThreadId.make("runtime-pr-watch-autofix");
+      yield* seedProject({
+        projectId: ProjectId.make("pr-autofix-project"),
+        title: "Autofix",
+        workspaceRoot: "/workspace/autofix",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-autofix-create"),
+        threadId,
+        projectId: ProjectId.make("pr-autofix-project"),
+        title: "Autofix",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 7 };
+      const watchOf = Effect.map(
+        orchestrator.getThreadShell(threadId),
+        (thread) => thread?.pullRequests?.[0]?.watch,
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-autofix-start"),
+        threadId,
+        ...key,
+        watching: true,
+        autofix: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/7", source: "manual" },
+      });
+      const started = yield* watchOf;
+      assert.isDefined(started);
+      if (started === undefined) return;
+      assert.isTrue(started.autofix);
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-autofix-repeat"),
+        threadId,
+        ...key,
+        watching: true,
+      });
+      assert.deepEqual(yield* watchOf, { ...started, autofixStartedWatch: false });
+      const stale = {
+        ...started,
+        autofixStartedWatch: false,
+        autofix: false,
+        headSha: "abc123",
+        wakes: 1,
+      };
+      const staleDisabled = yield* orchestrator
+        .dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("pr-autofix-stale-sync"),
+          threadId,
+          ...key,
+          startedAt: started.startedAt,
+          expectedAutofixGeneration: null,
+          watch: stale,
+        })
+        .pipe(Effect.flip);
+      assert.equal(staleDisabled._tag, "OrchestratorDispatchError");
+      assert.deepEqual(yield* watchOf, { ...started, autofixStartedWatch: false });
+      assert.isTrue((yield* maintenance.rebuild).valid);
+      assert.deepEqual(yield* watchOf, { ...started, autofixStartedWatch: false });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-autofix-disable"),
+        threadId,
+        ...key,
+        watching: true,
+        autofix: false,
+      });
+      assert.isFalse((yield* watchOf)?.autofix);
+      const staleEnabled = yield* orchestrator
+        .dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make("pr-autofix-stale-enabled-sync"),
+          threadId,
+          ...key,
+          startedAt: started.startedAt,
+          expectedAutofixGeneration: started.autofixGeneration,
+          watch: { ...stale, autofix: true, headSha: "def456" },
+        })
+        .pipe(Effect.flip);
+      assert.equal(staleEnabled._tag, "OrchestratorDispatchError");
+      assert.isFalse((yield* watchOf)?.autofix);
+    }),
+  );
+
+  it.effect("persists the CodeRabbit review flag in thread and shell projections", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+      const threadId = ThreadId.make("runtime-coderabbit-review");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("coderabbit-review-create"),
+        threadId,
+        projectId: ProjectId.make("coderabbit-review-project"),
+        title: "Review",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      assert.isFalse((yield* orchestrator.getThreadShell(threadId))?.codeRabbitReview);
+      for (const enabled of [true, false]) {
+        yield* orchestrator.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make(`coderabbit-review-toggle-${enabled}`),
+          threadId,
+          codeRabbitReview: enabled,
+        });
+        assert.equal(
+          (yield* orchestrator.getThreadRecords(threadId, [])).thread.codeRabbitReview,
+          enabled,
+        );
+        assert.equal((yield* orchestrator.getThreadShell(threadId))?.codeRabbitReview, enabled);
+        assert.equal(
+          (yield* orchestrator.getShellSnapshot()).threads.find((thread) => thread.id === threadId)
+            ?.codeRabbitReview,
+          enabled,
+        );
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        assert.equal((yield* orchestrator.getThreadShell(threadId))?.codeRabbitReview, enabled);
+      }
+    }),
+  );
+
   it.effect("starts, records, and stops a pull request watch", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -2267,6 +2843,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         ...key,
         startedAt: started.startedAt,
+        expectedAutofixGeneration: started.autofixGeneration,
         watch: recorded,
       });
       assert.deepEqual(yield* watchOf, recorded);
@@ -2287,6 +2864,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           threadId,
           ...key,
           startedAt: started.startedAt,
+          expectedAutofixGeneration: started.autofixGeneration,
           watch: { ...recorded, wakes: 2 },
           wake: {
             messageId: MessageId.make("pr-watch-late-wake"),
@@ -2372,6 +2950,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             ...key,
             number: 7,
             startedAt: started.startedAt,
+            expectedAutofixGeneration: started.autofixGeneration,
             watch: { ...started, headSha: "late", wakes: 1 },
             ...(wake === undefined ? {} : { wake }),
           })
@@ -2674,6 +3253,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         ...key,
         startedAt: started.startedAt,
+        expectedAutofixGeneration: started.autofixGeneration,
         watch: {
           ...started,
           headSha: "abc1234def",
@@ -2798,6 +3378,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         threadId,
         ...key,
         startedAt: started.startedAt,
+        expectedAutofixGeneration: started.autofixGeneration,
         watch: { ...started, headSha: "abc1234def", passed: true, passedChecks: ["lint"] },
       });
       yield* orchestrator.dispatch({

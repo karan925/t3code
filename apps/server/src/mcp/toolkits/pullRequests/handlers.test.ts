@@ -286,6 +286,10 @@ describe("pull request toolkit handlers", () => {
   it.effect("refuses to watch a merged pull request and stops an existing watch", () =>
     Effect.gen(function* () {
       const watch = {
+        autofix: false,
+        autofixRounds: 0,
+        autofixGeneration: null,
+        autofixStartedWatch: false,
         startedAt: "2026-08-20T00:00:00.000Z",
         headSha: null,
         failedChecks: [],

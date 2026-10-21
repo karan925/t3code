@@ -5,9 +5,38 @@ import {
   getProviderSkillsForSlashMenu,
   hasCompleteProviderWorkspaceSnapshot,
   resolveProviderForCwd,
+  hasProviderSkill,
   resolveProviderSkillsForCwd,
   resolveProviderSlashCommandsForCwd,
 } from "./providerSkills.ts";
+
+describe("hasProviderSkill", () => {
+  it("accepts enabled bare skill names", () => {
+    expect(hasProviderSkill([{ name: "autofix", enabled: true }], "autofix")).toBe(true);
+    expect(hasProviderSkill([{ name: "code-review", enabled: true }], "code-review")).toBe(true);
+    expect(hasProviderSkill([{ name: " Autofix ", enabled: true }], "autofix")).toBe(false);
+    expect(hasProviderSkill([{ name: "Autofix", enabled: true }], "autofix")).toBe(false);
+  });
+
+  it("rejects plugin-qualified names", () => {
+    expect(
+      hasProviderSkill([{ name: "coderabbit:code-review", enabled: true }], "code-review"),
+    ).toBe(false);
+    expect(hasProviderSkill([{ name: " CodeRabbit:Autofix ", enabled: true }], "autofix")).toBe(
+      false,
+    );
+    expect(hasProviderSkill([{ name: "other:autofix", enabled: true }], "autofix")).toBe(false);
+  });
+
+  it("rejects disabled skills and partial name matches", () => {
+    expect(hasProviderSkill([{ name: "autofix", enabled: false }], "autofix")).toBe(false);
+    expect(hasProviderSkill([{ name: "other-autofix", enabled: true }], "autofix")).toBe(false);
+    expect(hasProviderSkill([{ name: "code-review-extra", enabled: true }], "code-review")).toBe(
+      false,
+    );
+    expect(hasProviderSkill([], "autofix")).toBe(false);
+  });
+});
 
 const provider = {
   instanceId: ProviderInstanceId.make("codex"),

@@ -125,6 +125,35 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
 });
 
 describe("remote thread lifecycle commands", () => {
+  it.effect("disables Autofix without stopping the pull request watch", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const result = h.commands.watchPullRequest.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          threadId: THREAD_ID,
+          host: "github.com",
+          repository: "t3tools/t3code",
+          number: 42,
+          watching: true,
+          autofix: false,
+        },
+      });
+      const request = yield* Queue.take(h.requests);
+      expect(request.command).toMatchObject({
+        type: "thread.pull-request.watch",
+        threadId: THREAD_ID,
+        host: "github.com",
+        repository: "t3tools/t3code",
+        number: 42,
+        watching: true,
+        autofix: false,
+      });
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      expect((yield* Effect.promise(() => result))._tag).toBe("Success");
+    }),
+  );
+
   const actions = [
     ["settle", {}, { settledOverride: "settled", pinnedAt: null, snoozedUntil: null }],
     ["unsettle", { reason: "user" }, { settledOverride: "active", settledAt: null }],
@@ -133,6 +162,8 @@ describe("remote thread lifecycle commands", () => {
     ["pin", { orderKey: "a" }, { pinnedAt: expect.any(Object), pinOrderKey: "a" }],
     ["unpin", {}, { pinnedAt: null, pinOrderKey: null }],
     ["setAutoSettle", { enabled: false }, { autoSettleDisabledAt: expect.any(Object) }],
+    ["updateMetadata", { codeRabbitReview: true }, { codeRabbitReview: true }],
+    ["updateMetadata", { codeRabbitReview: false }, { codeRabbitReview: false }],
     ["reorderPin", { orderKey: "b" }, { pinOrderKey: "b" }],
     ["reorderActive", { orderKey: "b" }, { activeOrderKey: "b" }],
   ] as const;
@@ -157,6 +188,7 @@ describe("remote thread lifecycle commands", () => {
               ...(action === "unpin" || action === "settle"
                 ? { pinnedAt: NOW, pinOrderKey: "a" }
                 : {}),
+              ...(action === "updateMetadata" ? { codeRabbitReview: !input.codeRabbitReview } : {}),
             },
           ],
         };
@@ -201,6 +233,21 @@ describe("remote thread lifecycle commands", () => {
       const request = yield* Queue.take(h.requests);
       yield* Deferred.succeed(request.reply, { sequence: 2 });
       expect((yield* Effect.promise(() => result))._tag).toBe("Success");
+    }),
+  );
+
+  it.effect("does not add an optimistic entry for unrelated metadata updates", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const result = h.commands.updateMetadata.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, title: "Renamed" },
+      });
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
+      const request = yield* Queue.take(h.requests);
+      yield* Deferred.succeed(request.reply, { sequence: 3 });
+      expect((yield* Effect.promise(() => result))._tag).toBe("Success");
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
     }),
   );
 

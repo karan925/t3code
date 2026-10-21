@@ -5,11 +5,20 @@ import type {
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
-import { PULL_REQUEST_WATCH_WAKE_LIMIT, evaluatePullRequestWatch } from "./pullRequestWatch.ts";
+import {
+  AUTOFIX_ROUND_LIMIT,
+  PULL_REQUEST_WATCH_WAKE_LIMIT,
+  evaluatePullRequestWatch,
+  pullRequestWatchMessage,
+} from "./pullRequestWatch.ts";
 
 const STARTED = "2026-10-02T12:00:00.000Z";
 
 const watch = (overrides: Partial<ThreadPullRequestWatch> = {}): ThreadPullRequestWatch => ({
+  autofix: false,
+  autofixRounds: 0,
+  autofixGeneration: null,
+  autofixStartedWatch: false,
   startedAt: STARTED,
   headSha: null,
   failedChecks: [],
@@ -58,6 +67,78 @@ const remark = (
 const noRemarks: ReadonlyArray<PullRequestComment> = [];
 
 describe("evaluatePullRequestWatch", () => {
+  it.each([false, true])(
+    "stops Autofix after five rounds across pushes (owns watch: %s)",
+    (autofixStartedWatch) => {
+      let current = watch({ autofix: true, autofixRounds: 1, autofixStartedWatch });
+      for (let round = 2; round <= AUTOFIX_ROUND_LIMIT; round++) {
+        const review = remark("coderabbitai[bot]", `2026-10-02T12:0${round}:00Z`);
+        const report = evaluatePullRequestWatch(
+          current,
+          detail({ headSha: `commit-${round}`, checks: [check("test", "success")] }),
+          [review],
+        );
+        assert.isTrue(report.autofix);
+        assert.equal(report.next.autofixRounds, round);
+        assert.equal(report.next.autofix, round < AUTOFIX_ROUND_LIMIT);
+        assert.equal(report.next.autofixStartedWatch, autofixStartedWatch);
+        assert.equal(report.exhausted, round === AUTOFIX_ROUND_LIMIT && autofixStartedWatch);
+        if (round === AUTOFIX_ROUND_LIMIT) {
+          const message = pullRequestWatchMessage({
+            number: 12,
+            url: "https://github.com/o/r/pull/12",
+            baseBranch: "main",
+            headSha: report.next.headSha,
+            report,
+          });
+          assert.include(message.text, "$autofix ");
+          assert.include(message.text, `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`);
+          assert.include(
+            message.notification.summary,
+            `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`,
+          );
+          assert.equal(message.text.includes("T3 Code stopped watching."), autofixStartedWatch);
+          assert.include(message.text, "turn it on again in the thread panel");
+          assert.notInclude(message.text, "call unwatch_pull_request");
+        }
+        current = report.next;
+        assert.isFalse(evaluatePullRequestWatch(current, detail(), [review]).autofix);
+      }
+      const later = evaluatePullRequestWatch(current, detail(), [
+        remark("coderabbitai[bot]", "2026-10-02T13:00:00Z"),
+      ]);
+      assert.isFalse(later.autofix);
+      assert.equal(later.next.autofixRounds, AUTOFIX_ROUND_LIMIT);
+    },
+  );
+
+  it.each(["review", "review-comment"] as const)(
+    "reports edits to old CodeRabbit %s remarks without starting Autofix",
+    (kind) => {
+      const edited = {
+        ...remark("coderabbitai[bot]", STARTED, "✅ Addressed in commit abc123"),
+        kind,
+        editedAt: "2026-10-02T12:10:00Z",
+      };
+      const report = evaluatePullRequestWatch(
+        watch({ autofix: true, autofixRounds: 1, remarkIds: [edited.id] }),
+        detail(),
+        [edited],
+      );
+      assert.deepEqual(report.changes, [{ kind: "remarks", remarks: [edited] }]);
+      assert.isFalse(report.autofix);
+      assert.equal(report.next.autofixRounds, 1);
+      assert.equal(report.next.remarksThrough, edited.editedAt);
+    },
+  );
+
+  it("carries autofix into the next watch state", () => {
+    for (const autofix of [true, false]) {
+      const report = evaluatePullRequestWatch(watch({ autofix }), detail(), noRemarks);
+      assert.equal(report.next.autofix, autofix);
+    }
+  });
+
   it("reports each failure at once, even while another check never finishes", () => {
     const bot = check("CodeRabbit", "pending");
     const first = detail({ checks: [check("lint", "failure"), check("test", "pending"), bot] });
@@ -251,5 +332,125 @@ describe("evaluatePullRequestWatch", () => {
     const pushed = evaluatePullRequestWatch(tired, detail({ headSha: "cccccccccc" }), comments);
     assert.isFalse(pushed.exhausted);
     assert.equal(pushed.next.wakes, 1);
+  });
+});
+
+describe("pullRequestWatchMessage", () => {
+  it.each([false, true])(
+    "does not invoke Autofix for a top-level summary (edited: %s)",
+    (edited) => {
+      const summary: PullRequestComment = {
+        ...remark("coderabbitai[bot]", edited ? "2026-10-02T11:00:00Z" : "2026-10-02T12:10:00Z"),
+        kind: "issue-comment",
+        path: null,
+        body: "Review in progress: walkthrough summary",
+        ...(edited ? { editedAt: "2026-10-02T12:10:00Z" } : {}),
+      };
+      const report = evaluatePullRequestWatch(
+        watch({ autofix: true, autofixRounds: 1 }),
+        detail(),
+        [summary],
+      );
+      assert.equal(report.changes[0]?.kind, "remarks");
+      assert.isFalse(report.autofix);
+      assert.equal(report.next.autofixRounds, 1);
+      assert.notInclude(
+        pullRequestWatchMessage({
+          number: 12,
+          url: "https://github.com/o/r/pull/12",
+          baseBranch: "main",
+          headSha: report.next.headSha,
+          report,
+        }).text,
+        "$autofix",
+      );
+    },
+  );
+
+  it("invokes Autofix for a submitted review without an inline path", () => {
+    const report = evaluatePullRequestWatch(watch({ autofix: true }), detail(), [
+      {
+        ...remark("coderabbitai[bot]", "2026-10-02T12:10:00Z"),
+        kind: "review",
+        path: null,
+        reviewState: "CHANGES_REQUESTED",
+      },
+    ]);
+    assert.isTrue(report.autofix);
+    assert.equal(report.next.autofixRounds, 1);
+  });
+
+  it.each(["reviewer", "coderabbitai[bot]"])(
+    "ends Autofix once at the general comment limit (%s)",
+    (login) => {
+      const report = evaluatePullRequestWatch(
+        watch({ autofix: true, headSha: "aaaaaaaaaa", wakes: PULL_REQUEST_WATCH_WAKE_LIMIT - 1 }),
+        detail(),
+        [remark(login, "2026-10-02T12:10:00Z")],
+      );
+      assert.isTrue(report.exhausted);
+      const { text } = pullRequestWatchMessage({
+        number: 12,
+        url: "https://github.com/o/r/pull/12",
+        baseBranch: "main",
+        headSha: report.next.headSha,
+        report,
+      });
+      assert.equal(text.split("Autofix ended").length - 1, 1);
+      assert.include(text, "turn it back on in the thread panel");
+      assert.notInclude(text, "Call watch_pull_request");
+      assert.notInclude(text, "keeps watching");
+    },
+  );
+
+  it.each(["coderabbitai", "coderabbitai[bot]", "coderabbit[bot]", "CodeRabbitAI[bot]"])(
+    "invokes autofix for new remarks from %s and keeps watching",
+    (login) => {
+      const report = evaluatePullRequestWatch(watch({ autofix: true }), detail(), [
+        remark(login, "2026-10-02T12:10:00Z"),
+      ]);
+      const message = pullRequestWatchMessage({
+        number: 12,
+        url: "https://github.com/o/r/pull/12",
+        baseBranch: "main",
+        headSha: report.next.headSha,
+        report,
+      });
+      assert.include(message.text, "$autofix ");
+      assert.include(message.text, "do not call unwatch_pull_request");
+    },
+  );
+
+  it("keeps watching without invoking autofix for a human remark", () => {
+    const report = evaluatePullRequestWatch(watch({ autofix: true }), detail(), [
+      remark("reviewer", "2026-10-02T12:10:00Z"),
+    ]);
+    const message = pullRequestWatchMessage({
+      number: 12,
+      url: "https://github.com/o/r/pull/12",
+      baseBranch: "main",
+      headSha: report.next.headSha,
+      report,
+    });
+    assert.notInclude(message.text, "$autofix");
+    assert.include(message.text, "do not call unwatch_pull_request");
+  });
+
+  it("leaves a regular watch's handoff guidance unchanged for CodeRabbit remarks", () => {
+    const report = evaluatePullRequestWatch(watch(), detail(), [
+      remark("coderabbitai[bot]", "2026-10-02T12:10:00Z"),
+    ]);
+    const message = pullRequestWatchMessage({
+      number: 12,
+      url: "https://github.com/o/r/pull/12",
+      baseBranch: "main",
+      headSha: report.next.headSha,
+      report,
+    });
+    assert.notInclude(message.text, "$autofix");
+    assert.include(
+      message.text,
+      "When you hand the work back to the user, call unwatch_pull_request first",
+    );
   });
 });

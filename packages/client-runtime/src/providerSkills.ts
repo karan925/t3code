@@ -7,6 +7,13 @@ import {
 
 export type ProviderSkillSourceKind = "app" | "repo" | "project" | "personal" | "system" | "other";
 
+export function hasProviderSkill(
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "enabled">>,
+  name: string,
+): boolean {
+  return skills.some((skill) => skill.enabled && skill.name === name);
+}
+
 function normalizePathSeparators(pathValue: string): string {
   return pathValue.replaceAll("\\", "/");
 }

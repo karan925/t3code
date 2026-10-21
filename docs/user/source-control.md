@@ -301,6 +301,20 @@ returns to your inbox.
 Cross-repository links use a project on the same host. Azure DevOps reviews require a project checked
 out from the matching organization and repository.
 
+### CodeRabbit
+
+Install the CodeRabbit CLI and sign in on the machine hosting your environment. The thread details
+panel then shows **CodeRabbit**. Choose **Install skills** to add the Autofix and code-review skills
+for detected agents, and confirm the installation on that host. Each option requires its skill to
+be available to the thread's selected provider.
+
+**Autofix** watches the thread's current pull request and asks the agent to fix CodeRabbit review
+findings. Open a pull request first. Enabling Autofix acts immediately on existing reviews and runs
+up to 5 autofix rounds, then turns off. You can turn it on again in the thread panel. Turning Autofix
+off keeps a watch started separately by you or the agent; it removes a watch started only for Autofix.
+**Run CLI review** reviews each completed user-started turn's changes with the CodeRabbit CLI and asks the
+agent to fix verified critical and major findings.
+
 ## GitHub stacks
 
 The Pull Requests page shows each PR's position in its GitHub stack. Open the stack badge in a

@@ -996,6 +996,16 @@ export function createServerEnvironmentAtoms<R, E>(
 
   return {
     configValueAtom,
+    codeRabbitStatus: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:coderabbit-status",
+      tag: WS_METHODS.serverGetCodeRabbitStatus,
+      idleTtlMs: 0,
+    }),
+    installCodeRabbitSkills: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:coderabbit-install-skills",
+      tag: WS_METHODS.serverInstallCodeRabbitSkills,
+      concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+    }),
     runStorageCleanup: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:run-storage-cleanup",
       tag: WS_METHODS.serverRunStorageCleanup,
