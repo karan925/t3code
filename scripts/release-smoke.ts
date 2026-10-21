@@ -29,6 +29,7 @@ const workspaceFiles = [
   "packages/ssh/package.json",
   "packages/tailscale/package.json",
   "packages/provider-core/package.json",
+  "packages/provider-coderabbit-cloud/package.json",
   "packages/provider-testing/package.json",
   "packages/provider-pi/package.json",
   "packages/provider-acp/package.json",
