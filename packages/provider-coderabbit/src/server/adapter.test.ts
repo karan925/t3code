@@ -2005,13 +2005,13 @@ it.live("resets the retry budget after each connection that processes traces", (
 );
 
 it.live.each([
-  ["latest", false],
-  ["probe", false],
-  ["latest", true],
-  ["probe", true],
-] as const)(
-  "resets the reconnect budget after an outage turn settles via %s (during backoff=%s)",
-  (mode, duringBackoff) =>
+  { mode: "latest", duringBackoff: false },
+  { mode: "probe", duringBackoff: false },
+  { mode: "latest", duringBackoff: true },
+  { mode: "probe", duringBackoff: true },
+])(
+  "resets the reconnect budget after an outage turn settles via $mode (during backoff=$duringBackoff)",
+  ({ mode, duringBackoff }) =>
     live(
       Effect.gen(function* () {
         const clock = yield* TestClock.make();
