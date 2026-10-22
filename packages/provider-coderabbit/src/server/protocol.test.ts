@@ -13,6 +13,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import {
+  CommandError,
   consumeCodeEvents,
   encodeCodeRequest,
   isKnownCodeEvent,
@@ -29,18 +30,36 @@ const receipt = {
   taskId: "task-1",
 };
 
-it.effect("keeps prior receipts observable when a later JSON frame is malformed", () =>
+it.effect("skips non-JSON and type-less lines without losing surrounding events", () =>
   Effect.gen(function* () {
     const events: CodeEvent[] = [];
-    const result = yield* consumeCodeEvents(
-      Stream.make(encode(receipt), new TextEncoder().encode("not JSON\n")),
+    yield* consumeCodeEvents(
+      Stream.make(
+        new TextEncoder().encode("Starting CodeRabbit\n"),
+        encode(receipt),
+        new TextEncoder().encode('{"incomplete":\n'),
+        encode({ payload: "diagnostic" }),
+        encode({ type: null }),
+        encode(null),
+        encode(receipt),
+        new TextEncoder().encode("Finished"),
+      ),
       (event) =>
         Effect.sync(() => {
           events.push(event);
         }),
-    ).pipe(Effect.exit);
-    assert.isTrue(Exit.isFailure(result));
-    assert.deepEqual(events, [receipt]);
+    );
+    assert.deepEqual(events, [receipt, receipt]);
+  }),
+);
+
+it.effect("propagates event-handler failures", () =>
+  Effect.gen(function* () {
+    const failure = new CommandError({ operation: "handle event" });
+    const error = yield* consumeCodeEvents(Stream.make(encode(receipt)), () =>
+      Effect.fail(failure),
+    ).pipe(Effect.flip);
+    assert.strictEqual(error, failure);
   }),
 );
 
@@ -98,13 +117,8 @@ it.effect("preserves unknown frames and known-frame drift without losing typed g
   }),
 );
 
-it.effect("rejects objects without a frame type and bounds each frame in bytes", () =>
+it.effect("bounds each frame in bytes without bounding the total stream", () =>
   Effect.gen(function* () {
-    const missingType = yield* consumeCodeEvents(
-      Stream.make(encode({ payload: "bad" })),
-      () => Effect.void,
-    ).pipe(Effect.exit);
-    assert.isTrue(Exit.isFailure(missingType));
     const oversized = yield* consumeCodeEvents(
       Stream.make(new Uint8Array(1_048_577).fill(32)),
       () => Effect.void,
@@ -279,6 +293,39 @@ it.live("closes stdin, drains large stderr, and returns nonzero exit codes", () 
       });
       assert.equal(code, 4);
       assert.deepEqual(events, [receipt]);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("accepts fake-CLI stdout diagnostics around valid frames", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-protocol-" });
+      const binaryPath = writeFakeCli({
+        directory: cwd,
+        name: "fake-cr",
+        source: `
+      console.log('Starting CodeRabbit');
+      console.log(${JSON.stringify(JSON.stringify(receipt))});
+      console.log('{invalid JSON');
+      console.log(JSON.stringify({ message: 'diagnostic' }));
+      process.stdout.write(${JSON.stringify(JSON.stringify(receipt))});
+    `,
+      });
+      const events: CodeEvent[] = [];
+      const code = yield* runCodeCommand({
+        binaryPath,
+        args: ["code", "ls", "--agent"],
+        cwd,
+        env: process.env,
+        onEvent: (event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+      });
+      assert.equal(code, 0);
+      assert.deepEqual(events, [receipt, receipt]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

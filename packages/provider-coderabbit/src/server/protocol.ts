@@ -385,13 +385,16 @@ export const consumeCodeEvents = Effect.fnUntraced(function* <E, R>(
     buffered = "";
     bytes = 0;
     if (!text) return;
-    const value = yield* decodeJson(text).pipe(
-      Effect.mapError((cause) => new CommandError({ operation: "decode JSON", cause })),
+    yield* decodeJson(text).pipe(
+      Effect.flatMap(decodeEvent),
+      Effect.matchEffect({
+        onFailure: () =>
+          Effect.logDebug("Skipping undecodable CodeRabbit stdout line", {
+            characters: text.length,
+          }),
+        onSuccess: onEvent,
+      }),
     );
-    const event = yield* decodeEvent(value).pipe(
-      Effect.mapError((cause) => new CommandError({ operation: "decode event", cause })),
-    );
-    yield* onEvent(event);
   });
   yield* Stream.runForEach(stream, (chunk) =>
     Effect.gen(function* () {

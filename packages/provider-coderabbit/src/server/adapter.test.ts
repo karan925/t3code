@@ -25,6 +25,8 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
@@ -117,6 +119,8 @@ interface FixtureOptions {
   readonly latest?: string;
   readonly create?: string;
   readonly unpublished?: boolean;
+  readonly show?: string;
+  readonly preflight?: string;
 }
 const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
   options: FixtureOptions = {},
@@ -140,7 +144,7 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     const emit=e=>process.stdout.write(JSON.stringify(e)+'\\n');
     const trace=(kind,fields={})=>emit({phase:'code',type:'trace',taskId:'task-123',seq:++seq,createdAt:'2026-10-16T00:00:00.000Z',kind,...fields});
     const end=(operation='op-1',outcome='completed')=>trace('turn_end',{turn:{...result.turn,queueItemId:operation,startSeq:1,endSeq:seq+1,outcome}});
-    const ack=(req,fields={})=>emit({phase:'code',type:'response',id:req.id,ok:true,status:'message_sent',clientOperationId:'op-1',...fields});
+    const ack=(req,fields={})=>emit({phase:'code',type:'response',id:req.id,ok:true,status:'message_sent',clientOperationId:'client-op-1',queueItemId:'op-1',...fields});
     const signal=name=>${JSON.stringify(dir)}+'/signal-'+name;
     const mark=name=>writeFileSync(signal(name),'1');
     const wait=name=>new Promise(resolve=>{if(existsSync(signal(name)))return resolve();const watcher=watch(${JSON.stringify(dir)},()=>{if(existsSync(signal(name))){watcher.close();resolve();}});if(existsSync(signal(name))){watcher.close();resolve();}});
@@ -152,6 +156,7 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     const rl=createInterface({input:process.stdin});
     rl.on('line',line=>{const req=JSON.parse(line);appendFileSync(${JSON.stringify(log)},JSON.stringify({request:req})+'\\n');(async()=>{
       switch(req.command){
+        case 'show': ${options.show ?? "ack(req,{status:'task_shown',task:result.task});"} break;
         case 'message': ${options.message ?? "ack(req);trace('agent_message',{text:'Working remotely'});end();"} break;
         case 'cancel': ${options.cancel ?? "ack(req,{status:'cancel_pending'});end('op-1','canceled');"} break;
         case 'steer': ${options.steer ?? "ack(req,{status:'steer_sent'});"} break;
@@ -165,11 +170,15 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     directory: dir,
     name: "git",
     source: `
-    import {appendFileSync} from "node:fs";
+    import {appendFileSync,writeFileSync,existsSync,watch} from "node:fs";
     const args=process.argv.slice(2);
     appendFileSync(${JSON.stringify(log)},JSON.stringify({git:args})+'\\n');
     if(args[0]==='symbolic-ref') console.log('main');
     if(args[0]==='rev-parse') console.log('abcdef');
+    const signal=name=>${JSON.stringify(dir)}+'/signal-'+name;
+    const mark=name=>writeFileSync(signal(name),'1');
+    const wait=name=>new Promise(resolve=>{if(existsSync(signal(name)))return resolve();const watcher=watch(${JSON.stringify(dir)},()=>{if(existsSync(signal(name))){watcher.close();resolve();}});if(existsSync(signal(name))){watcher.close();resolve();}});
+    ${options.preflight ?? ""}
     if(args[0]==='ls-remote') console.log('${options.unpublished ? "fedcba" : "abcdef"}\\trefs/heads/main');
     if(args[0]==='status') console.log(' M changed.ts');
   `,
@@ -395,7 +404,7 @@ it.live(
         expect(calls.find((call) => call.prompt)?.prompt).toBe(
           "Repository context\n\nDo bounded work",
         );
-        expect(calls.filter((call) => call.request)).toEqual([]);
+        expect(calls.filter((call) => call.request && call.request.command !== "show")).toEqual([]);
         expect(
           f.allEvents.some(
             (event) =>
@@ -426,9 +435,10 @@ it.live("rejects an unpublished new task before invoking the CodeRabbit CLI", ()
   live(
     Effect.gen(function* () {
       const f = yield* fixture({ initialTask: null, unpublished: true });
-      const error = yield* f.runtime.startTurn(f.turnInput).pipe(Effect.flip);
-      expect(error).toMatchObject({ _tag: "ProviderAdapterProtocolError" });
-      expect(error.message).toContain("Push `main` first");
+      yield* f.runtime.startTurn(f.turnInput);
+      const terminal = yield* f.terminal;
+      expect(terminal.status).toBe("failed");
+      expect(terminal.failure?.message).toContain("Push `main` first");
       expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
     }),
   ),
@@ -441,10 +451,10 @@ it.live(
       Effect.gen(function* () {
         const f = yield* fixture({
           message: `
-      const operation='op-'+req.id;
+      const operation=existsSync(signal('first-message'))?'op-second':'op-first';mark('first-message');
       trace('agent_message',{text:'Before admission '+operation});
       end('foreign-operation');
-      ack(req,{clientOperationId:operation});
+      ack(req,{queueItemId:operation});
       trace('user_message',{text:req.text,queueItemId:operation,source:'cli'});
       trace('agent_message',{text:'Admitted '+operation});
       mark(operation);await wait('finish-'+operation);end(operation);
@@ -452,15 +462,15 @@ it.live(
         });
         yield* f.runtime.startTurn(f.turnInput);
         const first = yield* f.started;
-        yield* f.assistant("Admitted op-r1");
+        yield* f.assistant("Admitted op-first");
         expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toEqual([]);
-        yield* f.mark("finish-op-r1");
+        yield* f.mark("finish-op-first");
         expect(yield* f.terminal).toMatchObject({ status: "completed", providerTurnId: first.id });
         yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
         const second = yield* f.started;
-        yield* f.assistant("Admitted op-r2");
+        yield* f.assistant("Admitted op-second");
         expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toHaveLength(1);
-        yield* f.mark("finish-op-r2");
+        yield* f.mark("finish-op-second");
         expect(yield* f.terminal).toMatchObject({
           status: "completed",
           providerTurnId: second.id,
@@ -471,10 +481,11 @@ it.live(
         expect(
           calls.filter((call) => call.args && !call.args.includes("--interactive")),
         ).toHaveLength(1);
-        expect(calls.flatMap((call) => (call.request ? [call.request.command] : []))).toEqual([
-          "message",
-          "message",
-        ]);
+        expect(
+          calls.flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
+        ).toEqual(["message", "message"]);
         expect(
           f.allEvents.filter(
             (event) =>
@@ -517,7 +528,9 @@ it.live(
         expect((yield* f.terminal).status).toBe("completed");
         expect(
           (yield* f.calls)
-            .flatMap((call) => (call.request ? [call.request] : []))
+            .flatMap((call) =>
+              call.request && call.request.command !== "show" ? [call.request] : [],
+            )
             .map(({ command, text }) => ({ command, text })),
         ).toEqual([
           { command: "message", text: "Do bounded work" },
@@ -767,14 +780,18 @@ it.live("defers cancellation until the message is admitted", () =>
       }).pipe(Effect.forkScoped);
       yield* Deferred.await(cancelling);
       expect(
-        (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+        (yield* f.calls).flatMap((call) =>
+          call.request && call.request.command !== "show" ? [call.request.command] : [],
+        ),
       ).toEqual(["message"]);
       expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toEqual([]);
       yield* f.mark("admit");
       yield* Fiber.join(cancel);
       expect((yield* f.terminal).status).toBe("cancelled");
       expect(
-        (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+        (yield* f.calls).flatMap((call) =>
+          call.request && call.request.command !== "show" ? [call.request.command] : [],
+        ),
       ).toEqual(["message", "cancel"]);
     }),
   ),
@@ -808,7 +825,7 @@ it.live("reads the correlated latest turn when task_updated reports terminal sta
       const f = yield* fixture({
         latest: "emit({...result,turn:{...result.turn,queueItemId:'op-1'}});",
         message:
-          "ack(req);trace('agent_message',{text:'Message admitted'});await wait('task-finished');emit({phase:'code',type:'status',status:'task_updated',task:result.task});",
+          "ack(req);trace('agent_message',{text:'Message admitted'});await wait('task-finished');emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-01T00:00:00Z'}});",
       });
       yield* f.runtime.startTurn(f.turnInput);
       yield* f.assistant("Message admitted");
@@ -876,7 +893,9 @@ it.live(
         expect(yield* wake.dispatchIfCurrent(Effect.succeed("stale"))).toEqual(Option.none());
         yield* wake.clearIfCurrent();
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
         expect(
           f.allEvents.flatMap((event) =>
@@ -942,7 +961,9 @@ it.live(
         expect((yield* f.calls).filter((call) => call.args).map((call) => call.args)).toEqual([
           ["code", "resume", "task-123", "--agent", "--interactive"],
         ]);
-        expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+        expect(
+          (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+        ).toEqual([]);
         expect(
           f.allEvents.some(
             (event) =>
@@ -967,7 +988,9 @@ it.live("recovers an initially submitted turn from terminal attach history", () 
         ["code", "resume", "task-123", "--agent", "--interactive"],
         ["code", "resume", "task-123", "--agent"],
       ]);
-      expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+      expect(
+        (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+      ).toEqual([]);
     }),
   ),
 );
@@ -1118,7 +1141,9 @@ it.live(
           failure: { class: "usage_limit", message: "Quota exceeded" },
         });
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
       }),
     ),
@@ -1155,7 +1180,9 @@ it.live(
             (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
           ).toHaveLength(2);
           expect(
-            (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+            (yield* f.calls).flatMap((call) =>
+              call.request && call.request.command !== "show" ? [call.request.command] : [],
+            ),
           ).toEqual(["message"]);
           expect(
             f.allEvents.some(
@@ -1187,7 +1214,9 @@ it.live("resumes a persisted running session without issuing a new message", () 
       expect((yield* f.calls).filter((call) => call.args).map((call) => call.args)).toEqual([
         ["code", "resume", "task-123", "--agent", "--interactive"],
       ]);
-      expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+      expect(
+        (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+      ).toEqual([]);
     }),
   ),
 );
@@ -1224,7 +1253,9 @@ it.live("clears an abandoned pending web continuation and invalidates its dispat
           .pipe(Effect.flip),
       ).toMatchObject({ _tag: "ProviderAdapterProtocolError" });
       expect(
-        (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+        (yield* f.calls).flatMap((call) =>
+          call.request && call.request.command !== "show" ? [call.request.command] : [],
+        ),
       ).toEqual(["message"]);
     }),
   ),
@@ -1238,7 +1269,7 @@ it.live(
         const f = yield* fixture({
           latest: "emit({...result,turn:{...result.turn,queueItemId:'operation-A'}});",
           message: `
-      ack(req,{clientOperationId:'operation-A'});
+      ack(req,{queueItemId:'operation-A'});
       trace('user_message',{text:req.text,queueItemId:'operation-A',source:'cli'});
       trace('agent_message',{text:'Turn A admitted'});
       await wait('queue-B');
@@ -1277,7 +1308,9 @@ it.live(
         expect(texts).toContain("Turn B output");
         expect(texts).toContain("Turn B completed");
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
       }),
@@ -1388,7 +1421,9 @@ it.live("waits for the single reconnect follower to become ready before sending 
           (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
         ).toHaveLength(2);
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message", "cancel"]);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
@@ -1398,7 +1433,10 @@ it.live("waits for the single reconnect follower to become ready before sending 
 it.live("fails unconfirmed admission after transport loss and blocks the next prompt", () =>
   live(
     Effect.gen(function* () {
-      const f = yield* fixture({ message: "process.stdout.end(()=>process.exit(1));" });
+      const f = yield* fixture({
+        message: "process.stdout.end(()=>process.exit(1));",
+        show: "ack(req,{task:readyTask});",
+      });
       yield* f.runtime.startTurn(f.turnInput);
       const terminal = yield* f.terminal;
       expect(terminal.status).toBe("failed");
@@ -1406,7 +1444,9 @@ it.live("fails unconfirmed admission after transport loss and blocks the next pr
       const error = yield* f.runtime.startTurn(nextTurn(f.turnInput, 2)).pipe(Effect.flip);
       expect(error).toMatchObject({ _tag: "ProviderAdapterProtocolError" });
       expect(
-        (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+        (yield* f.calls).flatMap((call) =>
+          call.request && call.request.command !== "show" ? [call.request.command] : [],
+        ),
       ).toEqual(["message"]);
     }),
   ),
@@ -1418,7 +1458,9 @@ it.live("fails unconfirmed admission after the request deadline and blocks the n
       const clock = yield* TestClock.make();
       yield* Effect.gen(function* () {
         const f = yield* fixture({
-          message: "mark('message-received');await wait('never-admit');",
+          message:
+            "if(!existsSync(signal('message-received'))){mark('message-received');await wait('never-admit');}else{ack(req);end();}",
+          show: "ack(req,{task:readyTask});",
         });
         yield* f.runtime.startTurn(f.turnInput);
         yield* f.wait("message-received");
@@ -1430,8 +1472,15 @@ it.live("fails unconfirmed admission after the request deadline and blocks the n
           yield* f.runtime.startTurn(nextTurn(f.turnInput, 2)).pipe(Effect.flip),
         ).toMatchObject({ _tag: "ProviderAdapterProtocolError" });
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
+        yield* f.runtime.startTurn(nextTurn(f.turnInput, 3));
+        expect((yield* f.terminal).status).toBe("completed");
+        expect((yield* f.calls).filter((call) => call.request?.command === "message")).toHaveLength(
+          2,
+        );
       }).pipe(Effect.provideService(Clock.Clock, clock));
     }),
   ),
@@ -1452,7 +1501,9 @@ it.live.each(["proven-operation", null])(
         yield* f.runtime.startTurn(f.turnInput);
         expect((yield* f.terminal).status).toBe("completed");
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
         expect(
           f.allEvents.some(
@@ -1479,6 +1530,7 @@ it.live("does not treat another user's buffered message as proof of local admiss
       const f = yield* fixture({
         message:
           "trace('user_message',{text:'Someone else sent this',queueItemId:'foreign-operation',source:'web'});process.stdout.end(()=>process.exit(0));",
+        show: "ack(req,{task:readyTask});",
       });
       yield* f.runtime.startTurn(f.turnInput);
       expect(yield* f.terminal).toMatchObject({
@@ -1489,7 +1541,9 @@ it.live("does not treat another user's buffered message as proof of local admiss
         _tag: "ProviderAdapterProtocolError",
       });
       expect(
-        (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+        (yield* f.calls).flatMap((call) =>
+          call.request && call.request.command !== "show" ? [call.request.command] : [],
+        ),
       ).toEqual(["message"]);
     }),
   ),
@@ -1498,7 +1552,7 @@ it.live("does not treat another user's buffered message as proof of local admiss
 it.live("preserves the unconfirmed-delivery guard when restoring a previously running thread", () =>
   live(
     Effect.gen(function* () {
-      const f = yield* fixture({ resumeStatus: "running" });
+      const f = yield* fixture({ resumeStatus: "running", show: "ack(req,{task:readyTask});" });
       const thread = yield* f.runtime.ensureThread({
         threadId: THREAD,
         modelSelection,
@@ -1517,7 +1571,10 @@ it.live("preserves the unconfirmed-delivery guard when restoring a previously ru
       expect(
         yield* f.runtime.startTurn({ ...f.turnInput, providerThread: thread }).pipe(Effect.flip),
       ).toMatchObject({ _tag: "ProviderAdapterProtocolError" });
-      expect(yield* f.calls).toEqual([]);
+      expect((yield* f.calls).filter((call) => call.request?.command === "message")).toEqual([]);
+      expect((yield* f.calls).some((call) => call.request?.command === "show")).toBe(true);
+      yield* f.runtime.startTurn({ ...nextTurn(f.turnInput, 2), providerThread: thread });
+      expect((yield* f.terminal).status).toBe("completed");
     }),
   ),
 );
@@ -1540,7 +1597,7 @@ it.live("exhausts exactly three reconnect retries at virtual two, four, and eigh
       yield* Effect.gen(function* () {
         const f = yield* fixture({
           initialTask: null,
-          open: "process.stdout.end(()=>process.exit(1));",
+          beforeReady: "process.stdout.end(()=>process.exit(1));",
         });
         yield* f.runtime.startTurn(f.turnInput);
         for (const milliseconds of [2_000, 4_000, 8_000]) {
@@ -1554,7 +1611,7 @@ it.live("exhausts exactly three reconnect retries at virtual two, four, and eigh
         const calls = yield* f.calls;
         expect(calls.filter((call) => call.args?.includes("--interactive"))).toHaveLength(4);
         expect(calls.filter((call) => call.args?.[1] === "new")).toHaveLength(1);
-        expect(calls.filter((call) => call.request)).toEqual([]);
+        expect(calls.filter((call) => call.request && call.request.command !== "show")).toEqual([]);
         expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toHaveLength(1);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
@@ -1581,14 +1638,18 @@ it.live("keeps the original message waiter when the first child exits before rea
         });
         yield* f.runtime.startTurn(f.turnInput);
         yield* Deferred.await(backoff);
-        expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+        expect(
+          (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+        ).toEqual([]);
         yield* clock.adjust("2 seconds");
         expect((yield* f.terminal).status).toBe("completed");
         expect(
           (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
         ).toHaveLength(2);
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
@@ -1663,7 +1724,9 @@ it.live("dispatches two complete buffered web turns as separate continuations", 
           ),
         ).toBe(false);
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
@@ -1717,7 +1780,9 @@ it.live("reconnects an idle task after EOF and observes the next web wake", () =
           (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
         ).toHaveLength(2);
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
@@ -1736,7 +1801,9 @@ it.live(
         });
         yield* f.runtime.startTurn(f.turnInput);
         expect((yield* f.terminal).status).toBe("failed");
-        expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+        expect(
+          (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+        ).toEqual([]);
         const savedThread = f.allEvents
           .flatMap((event) =>
             event.type === "provider_thread.updated" ? [event.providerThread] : [],
@@ -1766,7 +1833,9 @@ it.live(
         assert(Option.isSome(result));
         expect(result.value.status).toBe("completed");
         expect(
-          (yield* f.calls).flatMap((call) => (call.request ? [call.request.command] : [])),
+          (yield* f.calls).flatMap((call) =>
+            call.request && call.request.command !== "show" ? [call.request.command] : [],
+          ),
         ).toEqual(["message"]);
         expect(
           (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
@@ -1822,8 +1891,338 @@ it.live("cleans up an EOF-stuck process before spawning the next connection atte
         expect(
           (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
         ).toHaveLength(2);
-        expect((yield* f.calls).filter((call) => call.request)).toEqual([]);
+        expect(
+          (yield* f.calls).filter((call) => call.request && call.request.command !== "show"),
+        ).toEqual([]);
       }).pipe(Effect.provideService(Clock.Clock, observedClock));
     }),
   ),
+);
+
+it.live("resets the retry budget after every successful ready connection", () =>
+  live(
+    Effect.gen(function* () {
+      const clock = yield* TestClock.make();
+      const backoffs = yield* Queue.unbounded<number>();
+      const observedClock: Clock.Clock = {
+        ...clock,
+        sleep: (duration) =>
+          Effect.gen(function* () {
+            const ms = Duration.toMillis(duration);
+            if (ms < 60_000) yield* Queue.offer(backoffs, ms);
+            yield* clock.sleep(duration);
+          }),
+      };
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({
+          beforeReady:
+            "const generation=existsSync(signal('generation'))?Number(readFileSync(signal('generation'),'utf8'))+1:0;writeFileSync(signal('generation'),String(generation));seq=generation;",
+          open: "if(generation>0){trace('agent_message',{text:'Ready generation '+generation});if(generation===5)end();else{await wait('disconnect-'+generation);process.stdout.end(()=>process.exit(0));}}",
+          message:
+            "ack(req);trace('agent_message',{text:'Ready generation 0'});await wait('disconnect-0');process.stdout.end(()=>process.exit(0));",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        for (let generation = 0; generation < 5; generation++) {
+          yield* f.assistant("Ready generation " + generation);
+          yield* f.mark("disconnect-" + generation);
+          expect(yield* Queue.take(backoffs)).toBe(2_000);
+          yield* clock.adjust("2 seconds");
+        }
+        expect((yield* f.terminal).status).toBe("completed");
+        expect(
+          (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
+        ).toHaveLength(6);
+      }).pipe(Effect.provideService(Clock.Clock, observedClock));
+    }),
+  ),
+);
+
+it.live("skips stale terminal statuses buffered before message admission", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        readyTask: task,
+        message:
+          "for(let i=0;i<3;i++)emit({phase:'code',type:'status',status:'task_updated',task:result.task});ack(req);trace('user_message',{text:req.text,queueItemId:'op-1',source:'cli'});trace('agent_message',{text:'Admitted after stale statuses'});await wait('finish');end();",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      yield* f.assistant("Admitted after stale statuses");
+      expect(
+        (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+      ).toHaveLength(1);
+      expect(f.runtime.providerSession.status).toBe("running");
+      yield* f.mark("finish");
+      expect((yield* f.terminal).status).toBe("completed");
+    }),
+  ),
+);
+
+it.live("latest failure is deduplicated and leaves the turn and follower running", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        latest:
+          "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else{mark('latest-requested');await wait('latest-fail');process.exit(1);}",
+        message:
+          "ack(req);trace('agent_message',{text:'Admitted'});await wait('terminal-status');for(let i=0;i<3;i++)emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-01T00:00:00Z'}});await wait('after-latest');trace('agent_message',{text:'Follower survived latest failure'});await wait('finish');end();",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      yield* f.assistant("Admitted");
+      yield* f.mark("terminal-status");
+      yield* f.wait("latest-requested");
+      expect(
+        (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+      ).toHaveLength(2);
+      yield* f.mark("latest-fail");
+      yield* f.mark("after-latest");
+      yield* f.assistant("Follower survived latest failure");
+      expect(f.runtime.providerSession.status).toBe("running");
+      expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toEqual([]);
+      yield* f.mark("finish");
+      expect((yield* f.terminal).status).toBe("completed");
+      expect((yield* f.calls).filter((call) => call.args?.includes("--interactive"))).toHaveLength(
+        1,
+      );
+    }),
+  ),
+);
+
+it.live("correlates queue ids when the client operation id is distinct", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        message:
+          "ack(req,{clientOperationId:'different-client-id',queueItemId:'queue-id'});trace('user_message',{text:req.text,queueItemId:'queue-id',source:'cli'});end('queue-id');",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      expect(yield* Queue.size(f.wakes)).toBe(0);
+      expect(
+        f.allEvents.some(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.nativeConversationHeadRef?.nativeId === "queue-id",
+        ),
+      ).toBe(true);
+    }),
+  ),
+);
+
+it.live.each(["trace", "latest", "probe"])(
+  "settles a status-only wake via %s despite an earlier turn start",
+  (mode) =>
+    live(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          message:
+            "ack(req);end();await wait('wake');seq=20;emit({phase:'code',type:'status',status:'task_updated',task:{...readyTask," +
+            (mode === "probe" ? "" : "updatedAt:'2099-01-01T00:00:00Z'") +
+            "}});await wait('finish-web');" +
+            (mode === "trace"
+              ? "trace('turn_end',{turn:{...result.turn,queueItemId:'web-queue',startSeq:1,endSeq:21}});"
+              : "emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-02T00:00:00Z'}});"),
+          latest:
+            "emit({...result,turn:{...result.turn,queueItemId:'web-queue',startSeq:1,endSeq:21}});",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        expect((yield* f.terminal).status).toBe("completed");
+        yield* f.mark("wake");
+        yield* Queue.take(f.wakes);
+        const next = nextTurn(f.turnInput, 2);
+        yield* f.runtime.startTurn({
+          ...next,
+          message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+        });
+        yield* f.mark("finish-web");
+        expect((yield* f.terminal).status).toBe("completed");
+      }),
+    ),
+);
+
+it.live("ignores a trailing running status from the just-settled turn", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        latest: "emit({...result,turn:{...result.turn,queueItemId:'op-1',endSeq:1}});",
+        message:
+          "ack(req);end();emit({phase:'code',type:'status',status:'task_updated',task:readyTask});emit({phase:'code',type:'trace',kind:'agent_message',taskId:'task-123',seq:3,createdAt:'2026-10-16T00:00:00Z',text:'trailing processed'});mark('trailing');",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      yield* f.wait("trailing");
+      // A following command response proves the stdout consumer passed the trailing status.
+      yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
+      expect((yield* f.terminal).status).toBe("completed");
+      expect(yield* Queue.size(f.wakes)).toBe(0);
+    }),
+  ),
+);
+
+it.live("Stop during workspace preflight cancels without creating a cloud task", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        preflight: "if(args[0]==='ls-remote'){mark('preflight');await wait('release-preflight');}",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      const started = yield* f.started;
+      yield* f.wait("preflight");
+      yield* f.runtime.interruptTurn({ providerThread: f.thread, providerTurnId: started.id });
+      expect((yield* f.terminal).status).toBe("cancelled");
+      yield* f.mark("release-preflight");
+      expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+    }),
+  ),
+);
+
+it.live.each([true, false])("refreshes delivery metadata with show (success=%s)", (success) =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        show: success
+          ? "ack(req,{task:{...result.task,workingBranchName:'fresh-branch',patchStatus:'fresh-patch',deliveryStatus:'delivered'}});"
+          : "emit({phase:'code',type:'response',id:req.id,ok:false,error:{status:'unavailable',message:'Show failed'}});",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      const delivery = f.allEvents.find(
+        (event) =>
+          event.type === "message.updated" && event.message.text.includes("Working branch:"),
+      );
+      assert(delivery?.type === "message.updated");
+      expect(delivery.message.text).toContain(
+        success ? "Working branch: fresh-branch" : "Working branch: coderabbit/test",
+      );
+      expect(delivery.message.text).toContain(
+        success ? "delivery: delivered" : "delivery: pending",
+      );
+      expect((yield* f.calls).filter((call) => call.request?.command === "show")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.live("resolves unconfirmed admission from an idle show and latest before the next prompt", () =>
+  live(
+    Effect.gen(function* () {
+      const clock = yield* TestClock.make();
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({
+          message:
+            "if(!existsSync(signal('message-received'))){mark('message-received');await wait('never-admit');}else{ack(req);end();}",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.wait("message-received");
+        yield* clock.adjust("60 seconds");
+        expect((yield* f.terminal).status).toBe("failed");
+        yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
+        expect((yield* f.terminal).status).toBe("completed");
+        expect((yield* f.calls).filter((call) => call.request?.command === "message")).toHaveLength(
+          2,
+        );
+      }).pipe(Effect.provideService(Clock.Clock, clock));
+    }),
+  ),
+);
+
+it.live.each([true, false])(
+  "recovers completion buffered before acknowledgement (timestamp=%s)",
+  (timestamp) =>
+    live(
+      Effect.gen(function* () {
+        const clock = yield* TestClock.make();
+        yield* clock.setTime(1_000);
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            latest: "emit({...result,turn:{...result.turn,queueItemId:'op-1'}});",
+            message:
+              "trace('user_message',{text:req.text,queueItemId:'op-1',source:'cli'});emit({phase:'code',type:'status',status:'task_updated',task:readyTask});emit({phase:'code',type:'status',status:'task_updated',task:{...result.task," +
+              (timestamp ? "updatedAt:'1970-01-01T00:00:01.500Z'" : "") +
+              "}});mark('completion-buffered');await wait('acknowledge');ack(req);",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          yield* f.wait("completion-buffered");
+          yield* clock.setTime(2_000);
+          yield* f.mark("acknowledge");
+          expect((yield* f.terminal).status).toBe("completed");
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+      }),
+    ),
+);
+
+it.live.each(["failed", "unrelated"])(
+  "rechecks a newer terminal update after an in-flight lookup returned %s",
+  (first) =>
+    live(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          latest:
+            "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else if(!existsSync(signal('lookup-started'))){mark('lookup-started');await wait('release-lookup');" +
+            (first === "failed" ? "process.exit(1);" : "emit(result);") +
+            "}else{emit({...result,turn:{...result.turn,queueItemId:'op-1'}});}",
+          message:
+            "ack(req);trace('agent_message',{text:'Admitted'});await wait('status-one');emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-01T00:00:00Z'}});await wait('status-two');emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-02T00:00:00Z'}});trace('agent_message',{text:'New status processed'});",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.assistant("Admitted");
+        yield* f.mark("status-one");
+        yield* f.wait("lookup-started");
+        yield* f.mark("status-two");
+        yield* f.assistant("New status processed");
+        expect(
+          (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+        ).toHaveLength(2);
+        yield* f.mark("release-lookup");
+        expect((yield* f.terminal).status).toBe("completed");
+        expect(
+          (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+        ).toHaveLength(3);
+      }),
+    ),
+);
+
+it.live.each(["failed", "unrelated"])(
+  "retains a status-only wake arriving during an idle probe that returns %s",
+  (first) =>
+    live(
+      Effect.gen(function* () {
+        const barrier = yield* Deferred.make<void>();
+        const logger = Logger.make(({ message }) => {
+          if (JSON.stringify(message).includes("probe-barrier"))
+            Deferred.doneUnsafe(barrier, Effect.void);
+        });
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            latest:
+              "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else if(!existsSync(signal('probe-started'))){mark('probe-started');await wait('release-probe');" +
+              (first === "failed"
+                ? "process.exit(1);"
+                : "emit({...result,turn:{...result.turn,queueItemId:'op-1',endSeq:1}});") +
+              "}else{emit({...result,turn:{...result.turn,queueItemId:'web-queue',startSeq:1,endSeq:21}});}",
+            message:
+              "ack(req);end();await wait('stale-status');emit({phase:'code',type:'status',status:'task_updated',task:readyTask});await wait('new-status');emit({phase:'code',type:'status',status:'task_updated',task:readyTask});emit({phase:'code',type:'status',status:'task_updated',task:result.task});emit({phase:'code',type:'probe-barrier'});",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          expect((yield* f.terminal).status).toBe("completed");
+          yield* f.mark("stale-status");
+          yield* f.wait("probe-started");
+          yield* f.mark("new-status");
+          yield* Deferred.await(barrier);
+          yield* f.mark("release-probe");
+          yield* Queue.take(f.wakes);
+          const next = nextTurn(f.turnInput, 2);
+          yield* f.runtime.startTurn({
+            ...next,
+            message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+          });
+          expect((yield* f.terminal).status).toBe("completed");
+          expect(
+            (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+          ).toHaveLength(3);
+        }).pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        );
+      }),
+    ),
 );

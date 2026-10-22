@@ -173,7 +173,7 @@ their original values.
 
 For provider-specific setup and accounts, see [Codex](./providers-codex.md),
 [Claude](./providers-claude.md), [OpenCode](./providers-opencode.md),
-[Antigravity](./providers-antigravity.md), [Pi](./providers-pi.md), and
+[Antigravity](./providers-antigravity.md), [Pi](./providers-pi.md),
 [Muse Code](./providers-muse.md), and [CodeRabbit](./providers-coderabbit.md).
 
 ## Next steps
