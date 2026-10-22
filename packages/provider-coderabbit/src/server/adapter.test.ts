@@ -1226,11 +1226,10 @@ it.live("clears an abandoned pending web continuation and invalidates its dispat
     Effect.gen(function* () {
       const f = yield* fixture({
         message:
-          "ack(req);end();await wait('foreign');trace('user_message',{text:'Continue elsewhere',queueItemId:'web-operation',source:'web'});",
+          "ack(req);end();trace('user_message',{text:'Continue elsewhere',queueItemId:'web-operation',source:'web'});",
       });
       yield* f.runtime.startTurn(f.turnInput);
       yield* f.terminal;
-      yield* f.mark("foreign");
       const wake = yield* Queue.take(f.wakes);
       assert(wake.clearIfCurrent);
       assert(wake.dispatchIfCurrent);

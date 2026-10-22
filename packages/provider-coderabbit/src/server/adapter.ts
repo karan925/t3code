@@ -803,13 +803,8 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             }).pipe(
               Effect.catch((cause) => Effect.logDebug("CodeRabbit wake lookup unavailable", cause)),
             );
-          } while (
-            wakeProbePending &&
-            !closed &&
-            !active &&
-            !pendingWake &&
-            lastSettled === settled
-          );
+            if (closed || active || pendingWake || lastSettled !== settled) break;
+          } while (wakeProbePending);
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
