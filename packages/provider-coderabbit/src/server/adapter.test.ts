@@ -1,5 +1,5 @@
-// @effect-diagnostics nodeBuiltinImport:off - Native filesystem watches synchronize the fake subprocess without timers.
-import * as NodeFS from "node:fs";
+// @effect-diagnostics nodeBuiltinImport:off - Local sockets synchronize fake subprocesses without timers.
+import * as NodeNet from "node:net";
 import { assert, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -130,12 +130,81 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
   const env = yield* HostProcess.Environment;
   const dir = yield* fs.makeTempDirectoryScoped();
   const log = path.join(dir, "calls.jsonl");
+  const signals = new Set<string>();
+  const waiting = new Map<string, Set<() => void>>();
+  const sockets = new Set<NodeNet.Socket>();
+  const notify = (name: string) => {
+    signals.add(name);
+    for (const resume of waiting.get(name) ?? []) resume();
+    waiting.delete(name);
+  };
+  const subscribe = (name: string, resume: () => void) => {
+    if (signals.has(name)) {
+      resume();
+      return () => {};
+    }
+    let listeners = waiting.get(name);
+    if (!listeners) waiting.set(name, (listeners = new Set()));
+    listeners.add(resume);
+    return () => {
+      listeners.delete(resume);
+    };
+  };
+  const server = NodeNet.createServer((socket) => {
+    sockets.add(socket);
+    let buffered = "";
+    let unsubscribe = () => {};
+    socket.on("data", (data) => {
+      buffered += data.toString();
+      if (!buffered.includes("\n")) return;
+      const message = JSON.parse(buffered) as { command: "mark" | "wait"; name: string };
+      if (message.command === "mark") {
+        notify(message.name);
+        socket.end("ready\n");
+      } else unsubscribe = subscribe(message.name, () => socket.end("ready\n"));
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      unsubscribe();
+      sockets.delete(socket);
+    });
+  });
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      for (const socket of sockets) socket.destroy();
+      server.close();
+    }),
+  );
+  const port = yield* Effect.callback<number>((resume) => {
+    server.once("error", (error) => resume(Effect.die(error)));
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resume(
+        address && typeof address !== "string"
+          ? Effect.succeed(address.port)
+          : Effect.die(new Error("Missing fixture address")),
+      );
+    });
+  });
+  const script = (source: string) => source.replace(/\bmark\(/g, "await mark(");
+  const syncSource = `
+    const exchange=(command,name)=>new Promise((resolve,reject)=>{
+      const socket=createConnection({host:'127.0.0.1',port:${port}});
+      socket.on('error',reject);
+      socket.on('connect',()=>socket.write(JSON.stringify({command,name})+'\\n'));
+      socket.once('data',()=>{socket.end();resolve();});
+    });
+    const signal=name=>${JSON.stringify(dir)}+'/signal-'+name;
+    const mark=async name=>{writeFileSync(signal(name),'1');await exchange('mark',name);};
+    const wait=name=>exchange('wait',name);
+  `;
   const binary = writeFakeCli({
     directory: dir,
     name: "fake-cr",
     source: `
     import {readFileSync,appendFileSync,existsSync,writeFileSync,watch} from 'node:fs';
     import {createInterface} from 'node:readline';
+    import {createConnection} from 'node:net';
     const args=process.argv.slice(2);
     appendFileSync(${JSON.stringify(log)},JSON.stringify({args})+'\\n');
     const result=${JSON.stringify(result)},question=${JSON.stringify(question)};
@@ -145,25 +214,23 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     const trace=(kind,fields={})=>emit({phase:'code',type:'trace',taskId:'task-123',seq:++seq,createdAt:'2026-10-16T00:00:00.000Z',kind,...fields});
     const end=(operation='op-1',outcome='completed')=>trace('turn_end',{turn:{...result.turn,queueItemId:operation,startSeq:1,endSeq:seq+1,outcome}});
     const ack=(req,fields={})=>emit({phase:'code',type:'response',id:req.id,ok:true,status:'message_sent',clientOperationId:'client-op-1',queueItemId:'op-1',...fields});
-    const signal=name=>${JSON.stringify(dir)}+'/signal-'+name;
-    const mark=name=>writeFileSync(signal(name),'1');
-    const wait=name=>new Promise(resolve=>{if(existsSync(signal(name)))return resolve();const watcher=watch(${JSON.stringify(dir)},()=>{if(existsSync(signal(name))){watcher.close();resolve();}});if(existsSync(signal(name))){watcher.close();resolve();}});
-    if(args[1]==='new') { const prompt=readFileSync(0,'utf8');appendFileSync(${JSON.stringify(log)},JSON.stringify({prompt})+'\\n'); ${options.create ?? ""} emit({phase:'code',type:'complete',status:'task_submitted',taskId:'task-123',url:result.task.url,created:true,task:{...result.task,turnStatus:'running'},warnings:[]});process.exit(0); }
-    if(!args.includes('--interactive')){${options.latest ?? "emit(result);"}process.exit(0);}
-    ${options.beforeReady ?? ""}
+    ${syncSource}
+    if(args[1]==='new') { const prompt=readFileSync(0,'utf8');appendFileSync(${JSON.stringify(log)},JSON.stringify({prompt})+'\\n'); ${script(options.create ?? "")} emit({phase:'code',type:'complete',status:'task_submitted',taskId:'task-123',url:result.task.url,created:true,task:{...result.task,turnStatus:'running'},warnings:[]});process.exit(0); }
+    if(!args.includes('--interactive')){${script(options.latest ?? "emit(result);")}process.exit(0);}
+    ${script(options.beforeReady ?? "")}
     emit({phase:'code',type:'session',status:'ready',taskId:'task-123',protocolVersion:1,commands:['message','steer','answer','cancel','show','close'],cursor:0,task:readyTask});
-    ${options.open ?? (options.initialTask === null ? "trace('agent_message',{text:'New task is running'});end(null);" : "")}
+    ${script(options.open ?? (options.initialTask === null ? "trace('agent_message',{text:'New task is running'});end(null);" : ""))}
     const rl=createInterface({input:process.stdin});
     rl.on('line',line=>{const req=JSON.parse(line);appendFileSync(${JSON.stringify(log)},JSON.stringify({request:req})+'\\n');(async()=>{
       switch(req.command){
-        case 'show': ${options.show ?? "ack(req,{status:'task_shown',task:result.task});"} break;
-        case 'message': ${options.message ?? "ack(req);trace('agent_message',{text:'Working remotely'});end();"} break;
-        case 'cancel': ${options.cancel ?? "ack(req,{status:'cancel_pending'});end('op-1','canceled');"} break;
-        case 'steer': ${options.steer ?? "ack(req,{status:'steer_sent'});"} break;
-        case 'answer': ${options.answer ?? "ack(req,{status:'answer_sent'});trace('answer_submitted',{interactionId:question.question.interactionId});end();"} break;
+        case 'show': ${script(options.show ?? "ack(req,{status:'task_shown',task:result.task});")} break;
+        case 'message': ${script(options.message ?? "ack(req);trace('agent_message',{text:'Working remotely'});end();")} break;
+        case 'cancel': ${script(options.cancel ?? "ack(req,{status:'cancel_pending'});end('op-1','canceled');")} break;
+        case 'steer': ${script(options.steer ?? "ack(req,{status:'steer_sent'});")} break;
+        case 'answer': ${script(options.answer ?? "ack(req,{status:'answer_sent'});trace('answer_submitted',{interactionId:question.question.interactionId});end();")} break;
       }
     })().catch(error=>{console.error(error);process.exit(1)});});
-    rl.on('close',()=>{${options.eof ?? "process.exit(0);"}});
+    rl.on('close',async()=>{${script(options.eof ?? "process.exit(0);")}});
   `,
   });
   writeFakeCli({
@@ -171,14 +238,13 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     name: "git",
     source: `
     import {appendFileSync,writeFileSync,existsSync,watch} from "node:fs";
+    import {createConnection} from "node:net";
     const args=process.argv.slice(2);
     appendFileSync(${JSON.stringify(log)},JSON.stringify({git:args})+'\\n');
     if(args[0]==='symbolic-ref') console.log('main');
     if(args[0]==='rev-parse') console.log('abcdef');
-    const signal=name=>${JSON.stringify(dir)}+'/signal-'+name;
-    const mark=name=>writeFileSync(signal(name),'1');
-    const wait=name=>new Promise(resolve=>{if(existsSync(signal(name)))return resolve();const watcher=watch(${JSON.stringify(dir)},()=>{if(existsSync(signal(name))){watcher.close();resolve();}});if(existsSync(signal(name))){watcher.close();resolve();}});
-    ${options.preflight ?? ""}
+    ${syncSource}
+    ${script(options.preflight ?? "")}
     if(args[0]==='ls-remote') console.log('${options.unpublished ? "fedcba" : "abcdef"}\\trefs/heads/main');
     if(args[0]==='status') console.log(' M changed.ts');
   `,
@@ -330,16 +396,14 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
         ),
     ),
   );
-  const mark = (name: string) => fs.writeFileString(path.join(dir, `signal-${name}`), "1");
+  const mark = (name: string) =>
+    fs
+      .writeFileString(path.join(dir, `signal-${name}`), "1")
+      .pipe(Effect.andThen(Effect.sync(() => notify(name))));
   const wait = (name: string) =>
-    Effect.callback<void, Error>((resume) => {
-      const file = path.join(dir, `signal-${name}`);
-      const watcher = NodeFS.watch(dir, () => {
-        if (NodeFS.existsSync(file)) resume(Effect.void);
-      });
-      watcher.on("error", (error) => resume(Effect.fail(error)));
-      if (NodeFS.existsSync(file)) resume(Effect.void);
-      return Effect.sync(() => watcher.close());
+    Effect.callback<void>((resume) => {
+      const unsubscribe = subscribe(name, () => resume(Effect.void));
+      return Effect.sync(unsubscribe);
     });
   const terminal = next("turn.terminal");
   const started = next(
