@@ -2004,9 +2004,14 @@ it.live("resets the retry budget after each connection that processes traces", (
   ),
 );
 
-it.live.each(["latest", "probe"])(
-  "resets the reconnect budget after an outage turn settles via %s without new traces",
-  (mode) =>
+it.live.each([
+  ["latest", false],
+  ["probe", false],
+  ["latest", true],
+  ["probe", true],
+] as const)(
+  "resets the reconnect budget after an outage turn settles via %s (during backoff=%s)",
+  (mode, duringBackoff) =>
     live(
       Effect.gen(function* () {
         const clock = yield* TestClock.make();
@@ -2030,6 +2035,9 @@ it.live.each(["latest", "probe"])(
               (mode === "probe" ? "end();" : "") +
               "await wait('disconnect-0');process.stdout.end(()=>process.exit(0));",
             latest:
+              (duringBackoff
+                ? "if(existsSync(signal('generation'))&&Number(readFileSync(signal('generation'),'utf8'))===1){mark('recovery-started');await wait('release-recovery');}"
+                : "") +
               "emit({...result,turn:{...result.turn,queueItemId:" +
               JSON.stringify(mode === "probe" ? "web-recovered" : "op-1") +
               ",startSeq:3,endSeq:50,finalReply:'Completed during outage'}});",
@@ -2040,6 +2048,12 @@ it.live.each(["latest", "probe"])(
           yield* f.mark("disconnect-0");
           expect(yield* Queue.take(backoffs)).toBe(2_000);
           yield* clock.adjust("2 seconds");
+          if (duringBackoff) {
+            yield* f.wait("recovery-started");
+            yield* f.mark("disconnect-1");
+            expect(yield* Queue.take(backoffs)).toBe(4_000);
+            yield* f.mark("release-recovery");
+          }
           if (mode === "probe") {
             yield* Queue.take(f.wakes);
             const next = nextTurn(f.turnInput, 2);
@@ -2049,11 +2063,18 @@ it.live.each(["latest", "probe"])(
             });
           }
           expect((yield* f.terminal).status).toBe("completed");
-          for (const [generation, ms] of [
-            [1, 2_000],
-            [2, 4_000],
-            [3, 8_000],
-          ] as const) {
+          if (duringBackoff) yield* clock.adjust("4 seconds");
+          const idleDisconnects = duringBackoff
+            ? ([
+                [2, 2_000],
+                [3, 4_000],
+              ] as const)
+            : ([
+                [1, 2_000],
+                [2, 4_000],
+                [3, 8_000],
+              ] as const);
+          for (const [generation, ms] of idleDisconnects) {
             yield* f.mark("disconnect-" + generation);
             expect(yield* Queue.take(backoffs)).toBe(ms);
             yield* clock.adjust(ms);

@@ -899,11 +899,11 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       const follow = Effect.fn("CodeRabbit.follow")(function* () {
         const retrySchedule = Schedule.max([Schedule.exponential("2 seconds"), Schedule.recurs(3)]);
         let backoff = yield* Schedule.toStepWithSleep(retrySchedule);
+        let accountedWorkVersion = workVersion;
         while (true) {
           if (closed) return;
           const taskId = thread?.nativeThreadRef?.nativeId;
           if (!taskId) break;
-          const connectionWorkVersion = workVersion;
           let processedWork = false;
           yield* Effect.scoped(
             Effect.gen(function* () {
@@ -945,8 +945,9 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             }),
           ).pipe(Effect.catch((cause) => Effect.logDebug("CodeRabbit connection ended", cause)));
           if (closed) return;
-          if (processedWork || workVersion !== connectionWorkVersion)
+          if (processedWork || workVersion !== accountedWorkVersion)
             backoff = yield* Schedule.toStepWithSleep(retrySchedule);
+          accountedWorkVersion = workVersion;
           const retry = yield* backoff(undefined).pipe(Effect.result);
           if (retry._tag === "Failure") break;
         }
