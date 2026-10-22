@@ -150,6 +150,7 @@ interface ActiveTurn {
   readonly providerTurn: OrchestrationV2ProviderTurn;
   readonly messageReceipt: Deferred.Deferred<void>;
   taskId: string | null;
+  createdTask: boolean;
   taskURL: string | null;
   operationId: string | null;
   acceptedSeq: number;
@@ -234,6 +235,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       let wakeProbeInFlight = false;
       let wakeProbeKey: string | null = null;
       let lastSeq = -1;
+      let workVersion = 0;
       let task: TaskDetail | null = null;
       let closed = false;
       let imported = input.initialNativeThreadId !== undefined;
@@ -319,6 +321,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         completed?: Turn,
       ) {
         if (!thread?.appThreadId || closed || frames.length === 0) return;
+        workVersion++;
         const wake = { events: frames, cursor, completed };
         pendingWake = wake;
         yield* updateSession("running");
@@ -353,7 +356,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       ) {
         if (turn.finished) return;
         turn.finished = true;
-        if (!turn.submitted && turn.awaitingMessageReceipt && turn.taskId !== null)
+        if (turn.taskId === null || (!turn.submitted && turn.awaitingMessageReceipt))
           yield* updateThread({ nativeConversationHeadRef: turn.previousHead });
         const at = yield* DateTime.now;
         if (turn.pending) {
@@ -556,6 +559,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         detail: TaskDetail | null,
       ) {
         if (turn.finished) return;
+        workVersion++;
         lastSeq = Math.max(lastSeq, result.endSeq ?? lastSeq);
         lastSettled = {
           queueItemId: result.queueItemId,
@@ -597,8 +601,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       const matchesTurn = (turn: ActiveTurn, result: Turn) =>
         turn.operationId !== null
           ? result.queueItemId === turn.operationId ||
-            (turn.input.providerThread.nativeThreadRef === null &&
-              turn.previousHead === null &&
+            (turn.createdTask &&
               result.queueItemId === null &&
               result.startSeq !== null &&
               result.startSeq >= turn.acceptedSeq)
@@ -900,6 +903,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           if (closed) return;
           const taskId = thread?.nativeThreadRef?.nativeId;
           if (!taskId) break;
+          const connectionWorkVersion = workVersion;
           let processedWork = false;
           yield* Effect.scoped(
             Effect.gen(function* () {
@@ -941,7 +945,8 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             }),
           ).pipe(Effect.catch((cause) => Effect.logDebug("CodeRabbit connection ended", cause)));
           if (closed) return;
-          if (processedWork) backoff = yield* Schedule.toStepWithSleep(retrySchedule);
+          if (processedWork || workVersion !== connectionWorkVersion)
+            backoff = yield* Schedule.toStepWithSleep(retrySchedule);
           const retry = yield* backoff(undefined).pipe(Effect.result);
           if (retry._tag === "Failure") break;
         }
@@ -1152,6 +1157,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             providerTurn,
             messageReceipt: yield* Deferred.make<void>(),
             taskId,
+            createdTask: false,
             taskURL: taskId
               ? `https://app.coderabbit.ai/code/tasks/${encodeURIComponent(taskId)}`
               : null,
@@ -1276,6 +1282,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               task = yield* createTask({ ...taskOptions, prompt: text }).pipe(
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
               );
+              turn.createdTask = true;
               turn.taskId = task.taskId;
               turn.taskURL = task.url;
               turn.awaitingMessageReceipt = false;

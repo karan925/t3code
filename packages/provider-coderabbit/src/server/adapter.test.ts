@@ -929,7 +929,6 @@ it.live(
         yield* f.terminal;
         assert(f.runtime.hasPendingBackgroundWork);
         assert(f.runtime.hasPendingBackgroundWorkForThread);
-        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
         yield* f.mark("web-message");
         const wake = yield* Queue.take(f.wakes);
@@ -958,7 +957,6 @@ it.live(
           message: { ...continuation.message, createdBy: "agent", creationSource: "provider" },
         });
         expect((yield* f.terminal).status).toBe("completed");
-        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
         expect(yield* wake.dispatchIfCurrent(Effect.succeed("stale"))).toEqual(Option.none());
         yield* wake.clearIfCurrent();
@@ -1305,7 +1303,6 @@ it.live("clears an abandoned pending web continuation and invalidates its dispat
       assert(wake.dispatchIfCurrent);
       assert(f.runtime.hasPendingBackgroundWork);
       yield* wake.clearIfCurrent();
-      assert(f.runtime.hasPendingBackgroundWork);
       expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
       expect(f.runtime.providerSession.status).toBe("ready");
       const dispatched = yield* Deferred.make<void>();
@@ -1382,7 +1379,6 @@ it.live(
             call.request && call.request.command !== "show" ? [call.request.command] : [],
           ),
         ).toEqual(["message"]);
-        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
       }),
     ),
@@ -2008,6 +2004,77 @@ it.live("resets the retry budget after each connection that processes traces", (
   ),
 );
 
+it.live.each(["latest", "probe"])(
+  "resets the reconnect budget after an outage turn settles via %s without new traces",
+  (mode) =>
+    live(
+      Effect.gen(function* () {
+        const clock = yield* TestClock.make();
+        const backoffs = yield* Queue.unbounded<number>();
+        const observedClock: Clock.Clock = {
+          ...clock,
+          sleep: (duration) =>
+            Effect.gen(function* () {
+              const ms = Duration.toMillis(duration);
+              if ([2_000, 4_000, 8_000].includes(ms)) yield* Queue.offer(backoffs, ms);
+              yield* clock.sleep(duration);
+            }),
+        };
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            beforeReady:
+              "const generation=existsSync(signal('generation'))?Number(readFileSync(signal('generation'),'utf8'))+1:0;writeFileSync(signal('generation'),String(generation));if(generation>0){seq=50;readyTask.turnStatus='completed';}",
+            open: "if(generation>0){if(generation===4){trace('user_message',{text:'Next web turn',queueItemId:'web-next',source:'web'});}else{emit({phase:'code',type:'status',status:'task_updated',task:readyTask});(async()=>{await wait('disconnect-'+generation);process.stdout.end(()=>process.exit(0));})();}}",
+            message:
+              "ack(req);mark('message-accepted');" +
+              (mode === "probe" ? "end();" : "") +
+              "await wait('disconnect-0');process.stdout.end(()=>process.exit(0));",
+            latest:
+              "emit({...result,turn:{...result.turn,queueItemId:" +
+              JSON.stringify(mode === "probe" ? "web-recovered" : "op-1") +
+              ",startSeq:3,endSeq:50,finalReply:'Completed during outage'}});",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          if (mode === "probe") yield* f.terminal;
+          else yield* f.wait("message-accepted");
+          yield* f.mark("disconnect-0");
+          expect(yield* Queue.take(backoffs)).toBe(2_000);
+          yield* clock.adjust("2 seconds");
+          if (mode === "probe") {
+            yield* Queue.take(f.wakes);
+            const next = nextTurn(f.turnInput, 2);
+            yield* f.runtime.startTurn({
+              ...next,
+              message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+            });
+          }
+          expect((yield* f.terminal).status).toBe("completed");
+          for (const [generation, ms] of [
+            [1, 2_000],
+            [2, 4_000],
+            [3, 8_000],
+          ] as const) {
+            yield* f.mark("disconnect-" + generation);
+            expect(yield* Queue.take(backoffs)).toBe(ms);
+            yield* clock.adjust(ms);
+          }
+          yield* Queue.take(f.wakes);
+          expect(f.runtime.providerSession.status).toBe("running");
+          expect(
+            (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
+          ).toHaveLength(5);
+          expect(
+            f.allEvents.some(
+              (event) =>
+                event.type === "provider_session.updated" &&
+                event.providerSession.status === "error",
+            ),
+          ).toBe(false);
+        }).pipe(Effect.provideService(Clock.Clock, observedClock));
+      }),
+    ),
+);
+
 it.live("skips stale terminal statuses buffered before message admission", () =>
   live(
     Effect.gen(function* () {
@@ -2354,7 +2421,7 @@ it.live.each(["probe", "status"])(
 );
 
 it.live.each(["auth", "exit", "timeout"])(
-  "allows retry after task creation fails with %s",
+  "settles a null-queue initial turn after task creation fails with %s",
   (failure) =>
     live(
       Effect.gen(function* () {
@@ -2362,6 +2429,7 @@ it.live.each(["auth", "exit", "timeout"])(
         yield* Effect.gen(function* () {
           const f = yield* fixture({
             initialTask: null,
+            open: "trace('user_message',{text:'Do bounded work',queueItemId:'initial-queue',source:'cli'});end(null);",
             create:
               "if(!existsSync(signal('create-failed'))){mark('create-failed');" +
               (failure === "auth"
@@ -2380,6 +2448,12 @@ it.live.each(["auth", "exit", "timeout"])(
             failure === "auth" ? "cr auth login" : "app.coderabbit.ai before retrying",
           );
           expect(failed.failure?.message).not.toContain("running: null");
+          const restored = f.allEvents.findLast(
+            (event) => event.type === "provider_thread.updated",
+          );
+          expect(restored).toMatchObject({
+            providerThread: { nativeConversationHeadRef: null, nativeThreadRef: null },
+          });
           yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
           expect((yield* f.terminal).status).toBe("completed");
           expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(2);
@@ -2554,11 +2628,12 @@ it.live("clears a restored unconfirmed guard when there is no native task id", (
   ),
 );
 
-it.live("matches an initial prompt queue id to a null-queue terminal turn", () =>
+it.live("matches an initial prompt queue id despite a saved initial head", () =>
   live(
     Effect.gen(function* () {
       const f = yield* fixture({
         initialTask: null,
+        savedHead: "initial:previous-attempt",
         open: "trace('user_message',{text:'Do bounded work',queueItemId:'initial-queue',source:'cli'});end(null);",
       });
       yield* f.runtime.startTurn(f.turnInput);
