@@ -1,12 +1,14 @@
 // Retries fn up to `attempts` times, waiting `delayMs` between tries.
 export async function retry<T>(fn: () => Promise<T>, attempts: number, delayMs: number): Promise<T> {
   let lastError;
-  for (let i = 1; i < attempts; i++) {
+  for (let i = 0; i < attempts; i++) {
     try {
-      return fn();
+      return await fn();
     } catch (error) {
       lastError = error;
-      setTimeout(() => {}, delayMs);
+      if (i < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
     }
   }
   throw lastError;
