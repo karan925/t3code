@@ -40,7 +40,7 @@ function reportFailure(title: string, result: AtomCommandResult<unknown, unknown
   toastManager.add({
     type: "error",
     title,
-    description: error instanceof Error ? error.message : "The ACP operation failed.",
+    description: error instanceof Error ? error.message : "The provider operation failed.",
   });
 }
 
@@ -147,7 +147,7 @@ export function AcpSessionManagementSection(props: {
       setNextCursor(result.value.nextCursor);
       return;
     }
-    reportFailure("Could not list ACP sessions", result);
+    reportFailure("Could not list sessions", result);
   };
 
   const importNativeSession = async (session: AcpRegistrySession) => {
@@ -179,18 +179,18 @@ export function AcpSessionManagementSection(props: {
       );
       toastManager.add({
         type: "success",
-        title: result.value.imported ? "ACP session imported" : "ACP session already imported",
+        title: result.value.imported ? "Session imported" : "Session already imported",
       });
       return;
     }
-    reportFailure("Could not import ACP session", result);
+    reportFailure("Could not import session", result);
   };
 
   const deleteNativeSession = async (session: AcpRegistrySession) => {
     if (projectId === null || deletingSessionId !== null || session.importedThreadId !== null)
       return;
     const confirmed = await ensureLocalApi().dialogs.confirm(
-      `Permanently delete native ACP session "${session.title ?? session.sessionId}"?`,
+      `Permanently delete native session "${session.title ?? session.sessionId}"?`,
       { variant: "destructive" },
     );
     if (!confirmed || !readEnvironmentScope(props.environmentId, AuthOrchestrationOperateScope))
@@ -205,10 +205,10 @@ export function AcpSessionManagementSection(props: {
       setSessions((current) =>
         current.filter((candidate) => candidate.sessionId !== session.sessionId),
       );
-      toastManager.add({ type: "success", title: "ACP session deleted" });
+      toastManager.add({ type: "success", title: "Session deleted" });
       return;
     }
-    reportFailure("Could not delete ACP session", result);
+    reportFailure("Could not delete session", result);
   };
 
   const loadProviders = async () => {
@@ -353,7 +353,7 @@ export function AcpSessionManagementSection(props: {
                     setProviderDrafts({});
                   }}
                 >
-                  <SelectTrigger aria-label="Project for ACP sessions" className="w-40" size="sm">
+                  <SelectTrigger aria-label="Project for sessions" className="w-40" size="sm">
                     <SelectValue>
                       {props.projects.find((project) => project.id === projectId)?.title}
                     </SelectValue>

@@ -159,6 +159,11 @@ describe("provider enabled defaults", () => {
   it("resolves instance enabled state with explicit false winning", () => {
     const grok = ProviderDriverKind.make("grok");
     const codex = ProviderDriverKind.make("codex");
+    const codeRabbit = ProviderDriverKind.make("coderabbit");
+    expect(resolveProviderInstanceEnabled({ driver: codeRabbit, config: {} })).toBe(false);
+    expect(resolveProviderInstanceEnabled({ driver: codeRabbit, enabled: true, config: {} })).toBe(
+      true,
+    );
     expect(resolveProviderInstanceEnabled({ driver: grok, config: {} })).toBe(false);
     expect(resolveProviderInstanceEnabled({ driver: codex, config: {} })).toBe(true);
     expect(
