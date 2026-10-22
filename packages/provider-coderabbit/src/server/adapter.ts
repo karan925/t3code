@@ -1480,7 +1480,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                       "agent_not_running",
                       "turn_finished",
                     ].includes(response.status)
-                  ? finish(turn, "cancelled")
+                  ? finish(turn, "cancelled").pipe(eventPermit.withPermits(1))
                   : Effect.void,
             ),
             Effect.mapError(

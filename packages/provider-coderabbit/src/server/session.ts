@@ -89,12 +89,20 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
   );
   yield* consumeCodeEvents(child.stdout, (frame) =>
     Effect.gen(function* () {
-      if (isCodeResponse(frame)) {
+      // Correlate on id alone so response-shape drift fails the request now, not at the timeout.
+      if (frame.type === "response" && typeof frame.id === "string") {
         const deferred = pending.get(frame.id);
-        if (deferred !== undefined) {
-          pending.delete(frame.id);
-          yield* Deferred.succeed(deferred, frame);
-        }
+        if (deferred === undefined) return;
+        pending.delete(frame.id);
+        yield* isCodeResponse(frame)
+          ? Deferred.succeed(deferred, frame)
+          : Deferred.fail(
+              deferred,
+              new CommandError({
+                operation: "decode response",
+                detail: "Unrecognized CodeRabbit response.",
+              }),
+            );
         return;
       }
       yield* Queue.offer(incoming, frame);

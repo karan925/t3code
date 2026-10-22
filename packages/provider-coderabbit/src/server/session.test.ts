@@ -171,6 +171,37 @@ it.live("fails pending requests when the CLI closes stdout without a response", 
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("fails a request whose response does not match the known shape", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-drift-" });
+      const binaryPath = writeFakeCli({
+        directory: cwd,
+        name: "fake-cr",
+        source: `
+    process.stdin.once('data', (chunk) => {
+      const { id } = JSON.parse(String(chunk).split('\\n')[0]);
+      process.stdout.write(JSON.stringify({ type: 'response', id, shape: 'unexpected' }) + '\\n');
+      process.stdin.resume();
+    });
+  `,
+      });
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const session = yield* openInteractiveSession({
+        binaryPath,
+        taskId: "task-1",
+        cwd,
+        env: process.env,
+        spawner,
+      });
+      const error = yield* session.request({ command: "show" }).pipe(Effect.flip);
+      assert.equal(error.message, "Unrecognized CodeRabbit response.");
+      yield* session.close;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect("times out at 60 seconds, cleans pending requests and ignores late replies", () =>
   Effect.scoped(
     Effect.gen(function* () {
