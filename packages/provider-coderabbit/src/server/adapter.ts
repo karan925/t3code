@@ -228,10 +228,11 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       let connectionReady = yield* Deferred.make<InteractiveSession, CommandError>();
       let admissionUncertain = false;
       let foreignMessages: CodeEvent[] = [];
-      let pendingWake: { events: CodeEvent[]; cursor: number } | null = null;
+      let pendingWake: { events: CodeEvent[]; cursor: number; completed: Turn | undefined } | null =
+        null;
       let lastSettled: { queueItemId: string | null; endSeq: number; at: number } | null = null;
       let wakeProbeInFlight = false;
-      let wakeProbePending = false;
+      let wakeProbeKey: string | null = null;
       let lastSeq = -1;
       let task: TaskDetail | null = null;
       let closed = false;
@@ -312,9 +313,13 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           },
         });
       });
-      const offerWake = Effect.fn("CodeRabbit.offerWake")(function* (frames: CodeEvent[]) {
+      const offerWake = Effect.fn("CodeRabbit.offerWake")(function* (
+        frames: CodeEvent[],
+        cursor: number,
+        completed?: Turn,
+      ) {
         if (!thread?.appThreadId || closed || frames.length === 0) return;
-        const wake = { events: frames, cursor: lastSeq };
+        const wake = { events: frames, cursor, completed };
         pendingWake = wake;
         yield* updateSession("running");
         yield* continuationRequests.offer({
@@ -425,7 +430,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         if (foreignMessages.length) {
           const queued = foreignMessages;
           foreignMessages = [];
-          yield* offerWake(queued);
+          yield* offerWake(queued, lastSettled?.endSeq ?? lastSeq);
         }
       }, Effect.uninterruptible);
       const ask = Effect.fnUntraced(function* (
@@ -551,19 +556,22 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         detail: TaskDetail | null,
       ) {
         if (turn.finished) return;
+        lastSeq = Math.max(lastSeq, result.endSeq ?? lastSeq);
         lastSettled = {
           queueItemId: result.queueItemId,
           endSeq: result.endSeq ?? lastSeq,
           at: DateTime.toEpochMillis(yield* DateTime.now),
         };
         if (interactive) {
-          const response = yield* interactive
-            .request({ command: "show" })
-            .pipe(
-              Effect.catch((cause) =>
-                Effect.logDebug("CodeRabbit delivery refresh failed", cause).pipe(Effect.as(null)),
-              ),
-            );
+          const response = yield* interactive.request({ command: "show" }).pipe(
+            Effect.timeoutOrElse({
+              duration: "5 seconds",
+              orElse: () => Effect.succeed(null),
+            }),
+            Effect.catch((cause) =>
+              Effect.logDebug("CodeRabbit delivery refresh failed", cause).pipe(Effect.as(null)),
+            ),
+          );
           if (response?.ok && response.task) detail = response.task;
         }
 
@@ -588,7 +596,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       // A status wake may miss user_message history; only its end cursor proves new work.
       const matchesTurn = (turn: ActiveTurn, result: Turn) =>
         turn.operationId !== null
-          ? result.queueItemId === turn.operationId
+          ? result.queueItemId === turn.operationId ||
+            (turn.input.providerThread.nativeThreadRef === null &&
+              turn.previousHead === null &&
+              result.queueItemId === null &&
+              result.startSeq !== null &&
+              result.startSeq >= turn.acceptedSeq)
           : turn.wakeCursor !== null
             ? result.endSeq !== null && result.endSeq > turn.wakeCursor
             : result.startSeq !== null && result.startSeq >= turn.acceptedSeq;
@@ -760,18 +773,18 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           );
         }
       });
-      const probeWake = Effect.fn("CodeRabbit.probeWake")(function* () {
+      const probeWake = Effect.fn("CodeRabbit.probeWake")(function* (detail: TaskDetail) {
         const settled = lastSettled;
         const taskId = thread?.nativeThreadRef?.nativeId;
         if (!settled || !taskId) return;
-        if (wakeProbeInFlight) {
-          wakeProbePending = true;
-          return;
-        }
+        const key = `${settled.endSeq}:${detail.turnStatus}:${detail.updatedAt ?? ""}`;
+        if (wakeProbeKey === key) return;
+        wakeProbeKey = key;
+        if (wakeProbeInFlight) return;
         wakeProbeInFlight = true;
         yield* Effect.gen(function* () {
-          do {
-            wakeProbePending = false;
+          while (true) {
+            const probeKey = wakeProbeKey;
             yield* Effect.gen(function* () {
               const result = yield* fetchLatestTurn({ ...taskOptions, taskId }).pipe(
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -788,23 +801,39 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                     result.turn.queueItemId === settled.queueItemId)
                 )
                   return;
-                yield* offerWake([
-                  {
-                    phase: "code",
-                    type: "trace",
-                    taskId,
-                    seq: result.turn.endSeq,
-                    createdAt: DateTime.formatIso(yield* DateTime.now),
-                    kind: "turn_end",
-                    turn: result.turn,
-                  },
-                ]);
+                task = result.task;
+                yield* offerWake(
+                  [
+                    {
+                      phase: "code",
+                      type: "trace",
+                      taskId,
+                      seq: result.turn.endSeq,
+                      createdAt: DateTime.formatIso(yield* DateTime.now),
+                      kind: "turn_end",
+                      turn: result.turn,
+                    },
+                  ],
+                  settled.endSeq,
+                  result.turn,
+                );
               }).pipe(eventPermit.withPermits(1));
             }).pipe(
-              Effect.catch((cause) => Effect.logDebug("CodeRabbit wake lookup unavailable", cause)),
+              Effect.catch((cause) => {
+                if (wakeProbeKey === probeKey) wakeProbeKey = null;
+                return Effect.logDebug("CodeRabbit wake lookup unavailable", cause);
+              }),
             );
-            if (closed || active || pendingWake || lastSettled !== settled) break;
-          } while (wakeProbePending);
+            if (
+              closed ||
+              active ||
+              pendingWake ||
+              lastSettled !== settled ||
+              wakeProbeKey === null ||
+              wakeProbeKey === probeKey
+            )
+              break;
+          }
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -835,7 +864,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           frame.task &&
           terminal(frame.task.turnStatus)
         ) {
-          yield* probeWake();
+          yield* probeWake(frame.task);
           return;
         }
         const foreign =
@@ -853,15 +882,16 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         if (!foreign) return;
         if (
           frame.type === "status" &&
+          frame.task &&
           lastSettled &&
           lastSeq <= lastSettled.endSeq &&
           !(frame.task?.updatedAt && Date.parse(frame.task.updatedAt) > lastSettled.at)
         ) {
           // Without a newer timestamp, queue identity distinguishes a stale status from new work.
-          yield* probeWake();
+          yield* probeWake(frame.task);
           return;
         }
-        yield* offerWake([frame]);
+        yield* offerWake([frame], lastSettled?.endSeq ?? lastSeq);
       });
       const follow = Effect.fn("CodeRabbit.follow")(function* () {
         const retrySchedule = Schedule.max([Schedule.exponential("2 seconds"), Schedule.recurs(3)]);
@@ -870,7 +900,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           if (closed) return;
           const taskId = thread?.nativeThreadRef?.nativeId;
           if (!taskId) break;
-          let reachedReady = false;
+          let processedWork = false;
           yield* Effect.scoped(
             Effect.gen(function* () {
               const child = yield* openInteractiveSession({ ...taskOptions, taskId, spawner });
@@ -891,14 +921,17 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                       frame.type === "session" &&
                       frame.status === "ready"
                     ) {
-                      reachedReady = true;
                       task = frame.task;
                       lastSeq = Math.max(lastSeq, frame.cursor ?? -1);
                       interactive = child;
                       if (active && !active.awaitingMessageReceipt && terminal(task.turnStatus))
                         yield* latest(active);
                       yield* Deferred.succeed(connectionReady, child);
-                    } else yield* route(frame);
+                    } else {
+                      if (isKnownCodeEvent(frame) && frame.type === "trace" && frame.seq > lastSeq)
+                        processedWork = true;
+                      yield* route(frame);
+                    }
                   }).pipe(eventPermit.withPermits(1)),
               ).pipe(Effect.catch((cause) => Effect.logDebug("CodeRabbit stream ended", cause)));
               // Pre-ready failures retain their waiters; completed generations get fresh readiness.
@@ -908,7 +941,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             }),
           ).pipe(Effect.catch((cause) => Effect.logDebug("CodeRabbit connection ended", cause)));
           if (closed) return;
-          if (reachedReady) backoff = yield* Schedule.toStepWithSleep(retrySchedule);
+          if (processedWork) backoff = yield* Schedule.toStepWithSleep(retrySchedule);
           const retry = yield* backoff(undefined).pipe(Effect.result);
           if (retry._tag === "Failure") break;
         }
@@ -1054,10 +1087,10 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             return yield* protocolError(
               "CodeRabbit requires a nonempty prompt of at most 65,536 characters",
             );
-          if (admissionUncertain) {
-            const uncertainTaskId = thread.nativeThreadRef?.nativeId;
-            if (!uncertainTaskId)
-              return yield* protocolError("Unconfirmed CodeRabbit task has no native task id");
+          let recovered: { turn: Turn; task: TaskDetail } | null = null;
+          const uncertainTaskId = thread.nativeThreadRef?.nativeId;
+          if (!uncertainTaskId) admissionUncertain = false;
+          if (admissionUncertain && uncertainTaskId) {
             const child = yield* ensureInteractive().pipe(Effect.option);
             const shown = Option.isSome(child)
               ? yield* child.value.request({ command: "show" }).pipe(Effect.option)
@@ -1081,6 +1114,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                   )
                 : null,
             });
+            if (Option.isSome(history)) recovered = history.value;
             if (Option.isNone(history)) {
               reattachOnNextTurn = false;
               return yield* protocolError(
@@ -1195,6 +1229,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                 turn.wakeCursor = null;
               }
               yield* Deferred.succeed(turn.messageReceipt, undefined);
+              if (wake?.completed) yield* settle(turn, wake.completed, task);
               if (wake)
                 for (const frame of wake.events) {
                   if (turn.finished) yield* route(frame);
@@ -1212,6 +1247,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               return;
             }
             if (reattach) {
+              if (recovered) {
+                yield* settle(turn, recovered.turn, recovered.task).pipe(
+                  eventPermit.withPermits(1),
+                );
+                return;
+              }
               // A pending receipt is ambiguous after a crash; never resend or cancel possibly admitted work.
               if (savedHead === null || savedHead.startsWith("pending:")) {
                 admissionUncertain = true;
@@ -1293,7 +1334,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             Effect.catch((cause) =>
               Effect.gen(function* () {
                 if (turn.finished) return;
-                if (turn.submitted && turn.awaitingMessageReceipt) {
+                if (turn.taskId !== null && turn.submitted && turn.awaitingMessageReceipt) {
                   const proof = turn.buffered.find(
                     (frame) =>
                       isKnownCodeEvent(frame) &&
@@ -1340,7 +1381,9 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                   "failed",
                   /auth/i.test(cause.message)
                     ? "Run `cr auth login` on the T3 server host."
-                    : cause.message,
+                    : turn.taskId === null && turn.submitted
+                      ? `${cause.message} Check your CodeRabbit task list at app.coderabbit.ai before retrying.`
+                      : cause.message,
                 );
               }),
             ),

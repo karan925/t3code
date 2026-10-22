@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Local sockets synchronize fake subprocesses without timers.
+import * as Tasks from "./tasks.ts";
 import * as NodeNet from "node:net";
-import { assert, expect, it } from "@effect/vitest";
+import { assert, expect, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ChatAttachmentId,
@@ -212,13 +213,16 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     let seq=0;
     const emit=e=>process.stdout.write(JSON.stringify(e)+'\\n');
     const trace=(kind,fields={})=>emit({phase:'code',type:'trace',taskId:'task-123',seq:++seq,createdAt:'2026-10-16T00:00:00.000Z',kind,...fields});
-    const end=(operation='op-1',outcome='completed')=>trace('turn_end',{turn:{...result.turn,queueItemId:operation,startSeq:1,endSeq:seq+1,outcome}});
+    const end=(operation='op-1',outcome='completed',fields={})=>{
+      ++seq;
+      emit({phase:'code',type:'trace',taskId:'task-123',seq,createdAt:'2026-10-16T00:00:00.000Z',kind:'turn_end',turn:{...result.turn,startSeq:1,...fields,queueItemId:operation,endSeq:seq,outcome}});
+    };
     const ack=(req,fields={})=>emit({phase:'code',type:'response',id:req.id,ok:true,status:'message_sent',clientOperationId:'client-op-1',queueItemId:'op-1',...fields});
     ${syncSource}
     if(args[1]==='new') { const prompt=readFileSync(0,'utf8');appendFileSync(${JSON.stringify(log)},JSON.stringify({prompt})+'\\n'); ${script(options.create ?? "")} emit({phase:'code',type:'complete',status:'task_submitted',taskId:'task-123',url:result.task.url,created:true,task:{...result.task,turnStatus:'running'},warnings:[]});process.exit(0); }
     if(!args.includes('--interactive')){${script(options.latest ?? "emit(result);")}process.exit(0);}
     ${script(options.beforeReady ?? "")}
-    emit({phase:'code',type:'session',status:'ready',taskId:'task-123',protocolVersion:1,commands:['message','steer','answer','cancel','show','close'],cursor:0,task:readyTask});
+    emit({phase:'code',type:'session',status:'ready',taskId:'task-123',protocolVersion:1,commands:['message','steer','answer','cancel','show','close'],cursor:seq,task:readyTask});
     ${script(options.open ?? (options.initialTask === null ? "trace('agent_message',{text:'New task is running'});end(null);" : ""))}
     const rl=createInterface({input:process.stdin});
     rl.on('line',line=>{const req=JSON.parse(line);appendFileSync(${JSON.stringify(log)},JSON.stringify({request:req})+'\\n');(async()=>{
@@ -918,13 +922,14 @@ it.live(
       ack(req);end();await wait('web-message');
       trace('user_message',{text:'Please continue from the web app',source:'web',queueItemId:'web-op'});
       trace('agent_message',{text:'Working for the web user'});
-      trace('turn_end',{turn:{...result.turn,queueItemId:'web-op',startSeq:3,endSeq:seq+1,finalReply:'Web continuation completed'}});
+      end('web-op','completed',{startSeq:3,finalReply:'Web continuation completed'});
     `,
         });
         yield* f.runtime.startTurn(f.turnInput);
         yield* f.terminal;
         assert(f.runtime.hasPendingBackgroundWork);
         assert(f.runtime.hasPendingBackgroundWorkForThread);
+        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
         yield* f.mark("web-message");
         const wake = yield* Queue.take(f.wakes);
@@ -953,6 +958,7 @@ it.live(
           message: { ...continuation.message, createdBy: "agent", creationSource: "provider" },
         });
         expect((yield* f.terminal).status).toBe("completed");
+        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
         expect(yield* wake.dispatchIfCurrent(Effect.succeed("stale"))).toEqual(Option.none());
         yield* wake.clearIfCurrent();
@@ -1299,6 +1305,7 @@ it.live("clears an abandoned pending web continuation and invalidates its dispat
       assert(wake.dispatchIfCurrent);
       assert(f.runtime.hasPendingBackgroundWork);
       yield* wake.clearIfCurrent();
+      assert(f.runtime.hasPendingBackgroundWork);
       expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
       expect(f.runtime.providerSession.status).toBe("ready");
       const dispatched = yield* Deferred.make<void>();
@@ -1343,7 +1350,7 @@ it.live(
       emit({phase:'code',type:'status',status:'task_updated',task:result.task});
       trace('agent_message',{text:'Turn B output'});
       await wait('finish-B');
-      trace('turn_end',{turn:{...result.turn,queueItemId:'operation-B',startSeq:6,endSeq:seq+1,finalReply:'Turn B completed'}});
+      end('operation-B','completed',{startSeq:6,finalReply:'Turn B completed'});
     `,
         });
         yield* f.runtime.startTurn(f.turnInput);
@@ -1375,6 +1382,7 @@ it.live(
             call.request && call.request.command !== "show" ? [call.request.command] : [],
           ),
         ).toEqual(["message"]);
+        assert(f.runtime.hasPendingBackgroundWork);
         expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
       }),
     ),
@@ -1738,10 +1746,10 @@ it.live("dispatches two complete buffered web turns as separate continuations", 
         ack(req);end();await wait('web-batch');
         trace('user_message',{text:'Web request B',queueItemId:'operation-B',source:'web'});
         trace('agent_message',{text:'Web output B'});
-        trace('turn_end',{turn:{...result.turn,queueItemId:'operation-B',startSeq:2,endSeq:seq+1,finalReply:'B completed'}});
+        end('operation-B','completed',{startSeq:2,finalReply:'B completed'});
         trace('user_message',{text:'Web request C',queueItemId:'operation-C',source:'web'});
         trace('agent_message',{text:'Web output C'});
-        trace('turn_end',{turn:{...result.turn,queueItemId:'operation-C',startSeq:5,endSeq:seq+1,finalReply:'C completed'}});
+        end('operation-C','completed',{startSeq:5,finalReply:'C completed'});
         process.stdout.end(()=>process.exit(0));
       `,
         });
@@ -1814,7 +1822,7 @@ it.live("reconnects an idle task after EOF and observes the next web wake", () =
           open: `if(existsSync(signal('idle-disconnected'))){
           seq=2;trace('user_message',{text:'Continue after idle disconnect',queueItemId:'web-operation',source:'web'});
           trace('agent_message',{text:'Idle reconnect observed this work'});
-          trace('turn_end',{turn:{...result.turn,queueItemId:'web-operation',startSeq:3,endSeq:seq+1}});
+          end('web-operation','completed',{startSeq:3});
         }`,
           message:
             "ack(req);trace('agent_message',{text:'Local work'});end();await wait('disconnect-idle');mark('idle-disconnected');process.stdout.end(()=>process.exit(0));",
@@ -1962,7 +1970,7 @@ it.live("cleans up an EOF-stuck process before spawning the next connection atte
   ),
 );
 
-it.live("resets the retry budget after every successful ready connection", () =>
+it.live("resets the retry budget after each connection that processes traces", () =>
   live(
     Effect.gen(function* () {
       const clock = yield* TestClock.make();
@@ -1972,7 +1980,7 @@ it.live("resets the retry budget after every successful ready connection", () =>
         sleep: (duration) =>
           Effect.gen(function* () {
             const ms = Duration.toMillis(duration);
-            if (ms < 60_000) yield* Queue.offer(backoffs, ms);
+            if ([2_000, 4_000, 8_000].includes(ms)) yield* Queue.offer(backoffs, ms);
             yield* clock.sleep(duration);
           }),
       };
@@ -2288,4 +2296,312 @@ it.live.each(["failed", "unrelated"])(
         );
       }),
     ),
+);
+
+it.live.each(["probe", "status"])(
+  "settles a %s wake whose completed end equals the inclusive reconnect cursor",
+  (mode) =>
+    live(
+      Effect.gen(function* () {
+        const clock = yield* TestClock.make();
+        const backoff = yield* Deferred.make<void>();
+        const observedClock: Clock.Clock = {
+          ...clock,
+          sleep: (duration) =>
+            Effect.gen(function* () {
+              if (Duration.toMillis(duration) === 2_000)
+                yield* Deferred.succeed(backoff, undefined);
+              yield* clock.sleep(duration);
+            }),
+        };
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            beforeReady: "if(existsSync(signal('disconnect'))){seq=50;}",
+            open:
+              mode === "probe"
+                ? "if(seq===50){emit({phase:'code',type:'status',status:'task_updated',task:result.task});}"
+                : "if(seq===50){emit({phase:'code',type:'status',status:'task_updated',task:{...readyTask,updatedAt:'2099-01-01T00:00:00Z'}});(async()=>{await wait('terminal-status');emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-02T00:00:00Z'}});})();}",
+            latest:
+              "emit({...result,turn:{...result.turn,queueItemId:'web-B',startSeq:33,endSeq:50,finalReply:'Recovered web reply'}});",
+            message:
+              "ack(req);seq=31;end();await wait('disconnect-now');mark('disconnect');process.stdout.end(()=>process.exit(0));",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          expect((yield* f.terminal).status).toBe("completed");
+          yield* f.mark("disconnect-now");
+          yield* Deferred.await(backoff);
+          yield* clock.adjust("2 seconds");
+          yield* Queue.take(f.wakes);
+          const next = nextTurn(f.turnInput, 2);
+          yield* f.runtime.startTurn({
+            ...next,
+            message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+          });
+          if (mode === "status") yield* f.mark("terminal-status");
+          expect((yield* f.terminal).status).toBe("completed");
+          expect(f.allEvents).toContainEqual(
+            expect.objectContaining({
+              type: "message.updated",
+              message: expect.objectContaining({ runId: next.runId, text: "Recovered web reply" }),
+            }),
+          );
+          expect(
+            (yield* f.calls).filter((call) => call.request?.command === "message"),
+          ).toHaveLength(1);
+        }).pipe(Effect.provideService(Clock.Clock, observedClock));
+      }),
+    ),
+);
+
+it.live.each(["auth", "exit", "timeout"])(
+  "allows retry after task creation fails with %s",
+  (failure) =>
+    live(
+      Effect.gen(function* () {
+        const clock = yield* TestClock.make();
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            initialTask: null,
+            create:
+              "if(!existsSync(signal('create-failed'))){mark('create-failed');" +
+              (failure === "auth"
+                ? "emit({phase:'code',type:'error',status:'auth_required',message:'Authentication required'});process.exit(1);"
+                : failure === "exit"
+                  ? "process.exit(1);"
+                  : "await wait('never-created');") +
+              "}",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          yield* f.wait("create-failed");
+          if (failure === "timeout") yield* clock.adjust("10 minutes");
+          const failed = yield* f.terminal;
+          expect(failed.status).toBe("failed");
+          expect(failed.failure?.message).toContain(
+            failure === "auth" ? "cr auth login" : "app.coderabbit.ai before retrying",
+          );
+          expect(failed.failure?.message).not.toContain("running: null");
+          yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
+          expect((yield* f.terminal).status).toBe("completed");
+          expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(2);
+        }).pipe(Effect.provideService(Clock.Clock, clock));
+      }),
+    ),
+);
+
+it.live.each([true, false])("bounds reconnects with only ready/status frames (ready=%s)", (ready) =>
+  live(
+    Effect.gen(function* () {
+      const clock = yield* TestClock.make();
+      const backoffs = yield* Queue.unbounded<number>();
+      const observedClock: Clock.Clock = {
+        ...clock,
+        sleep: (duration) =>
+          Effect.gen(function* () {
+            const ms = Duration.toMillis(duration);
+            if ([2_000, 4_000, 8_000].includes(ms)) yield* Queue.offer(backoffs, ms);
+            yield* clock.sleep(duration);
+          }),
+      };
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({
+          initialTask: null,
+          beforeReady: ready ? "" : "process.stdout.end(()=>process.exit(1));",
+          open: "emit({phase:'code',type:'status',status:'task_updated',task:readyTask});process.stdout.end(()=>process.exit(0));",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        for (const ms of [2_000, 4_000, 8_000]) {
+          expect(yield* Queue.take(backoffs)).toBe(ms);
+          yield* clock.adjust(ms);
+        }
+        expect((yield* f.terminal).status).toBe("failed");
+        expect(
+          (yield* f.calls).filter((call) => call.args?.includes("--interactive")),
+        ).toHaveLength(4);
+      }).pipe(Effect.provideService(Clock.Clock, observedClock));
+    }),
+  ),
+);
+
+it.live("deduplicates in-flight idle probes and retries the same status after lookup failure", () =>
+  live(
+    Effect.gen(function* () {
+      const failed = yield* Deferred.make<void>();
+      const statusesProcessed = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        const text = JSON.stringify(message);
+        if (text.includes("CodeRabbit wake lookup unavailable"))
+          Deferred.doneUnsafe(failed, Effect.void);
+        if (text.includes("statuses-processed"))
+          Deferred.doneUnsafe(statusesProcessed, Effect.void);
+      });
+      yield* Effect.gen(function* () {
+        using lookup = vi.spyOn(Tasks, "fetchLatestTurn");
+        const f = yield* fixture({
+          latest:
+            "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else if(!existsSync(signal('probed'))){mark('probed');await wait('probe-result');process.exit(1);}else{emit({...result,turn:{...result.turn,queueItemId:'web-B',endSeq:50}});}",
+          message:
+            "ack(req);end();await wait('statuses');for(let i=0;i<3;i++)emit({phase:'code',type:'status',status:'task_updated',task:result.task});emit({phase:'code',type:'statuses-processed'});await wait('after-failure');mark('after-failure-ack');await wait('retry-status');emit({phase:'code',type:'status',status:'task_updated',task:result.task});",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.terminal;
+        yield* f.mark("statuses");
+        yield* f.wait("probed");
+        yield* Deferred.await(statusesProcessed);
+        yield* f.mark("probe-result");
+        yield* Deferred.await(failed);
+        yield* f.mark("after-failure");
+        yield* f.wait("after-failure-ack");
+        expect(lookup).toHaveBeenCalledTimes(2);
+        yield* f.mark("retry-status");
+        yield* Queue.take(f.wakes);
+        const next = nextTurn(f.turnInput, 2);
+        yield* f.runtime.startTurn({
+          ...next,
+          message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+        });
+        expect((yield* f.terminal).status).toBe("completed");
+        expect(lookup).toHaveBeenCalledTimes(3);
+      }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+      );
+    }),
+  ),
+);
+
+it.live("settles a restarted unacknowledged message from terminal history with its reply", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        resumeStatus: "running",
+        restart: true,
+        latest:
+          "emit({...result,turn:{...result.turn,queueItemId:'recovered-operation',finalReply:'Recovered terminal reply'}});",
+      });
+      const thread = yield* f.runtime.ensureThread({
+        threadId: THREAD,
+        modelSelection,
+        runtimePolicy: f.runtimePolicy,
+        existingProviderThread: {
+          ...f.thread,
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          nativeConversationHeadRef: {
+            driver: f.runtime.driver,
+            nativeId: "pending:previous-attempt",
+            strength: "strong",
+          },
+        },
+      });
+      yield* f.runtime.startTurn({ ...f.turnInput, providerThread: thread });
+      expect((yield* f.terminal).status).toBe("completed");
+      expect(f.allEvents).toContainEqual(
+        expect.objectContaining({
+          type: "message.updated",
+          message: expect.objectContaining({ text: "Recovered terminal reply" }),
+        }),
+      );
+      expect((yield* f.calls).filter((call) => call.request?.command === "message")).toEqual([]);
+    }),
+  ),
+);
+
+it.live("falls back to cached delivery metadata after five virtual seconds of stalled show", () =>
+  live(
+    Effect.gen(function* () {
+      const clock = yield* TestClock.make();
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({ show: "mark('show-stalled');await wait('never-show');" });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.wait("show-stalled");
+        yield* clock.adjust("5 seconds");
+        expect((yield* f.terminal).status).toBe("completed");
+        expect(f.allEvents).toContainEqual(
+          expect.objectContaining({
+            type: "message.updated",
+            message: expect.objectContaining({
+              text: expect.stringContaining("Working branch: coderabbit/test"),
+            }),
+          }),
+        );
+      }).pipe(Effect.provideService(Clock.Clock, clock));
+    }),
+  ),
+);
+
+it.live("clears a restored unconfirmed guard when there is no native task id", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({ initialTask: null });
+      const thread = yield* f.runtime.ensureThread({
+        threadId: THREAD,
+        modelSelection,
+        runtimePolicy: f.runtimePolicy,
+        existingProviderThread: {
+          ...f.thread,
+          firstRunOrdinal: 1,
+          nativeConversationHeadRef: {
+            driver: f.runtime.driver,
+            nativeId: "pending:old-attempt",
+            strength: "strong",
+          },
+        },
+      });
+      yield* f.runtime.startTurn({ ...f.turnInput, providerThread: thread });
+      expect((yield* f.terminal).status).toBe("completed");
+      expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.live("matches an initial prompt queue id to a null-queue terminal turn", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        open: "trace('user_message',{text:'Do bounded work',queueItemId:'initial-queue',source:'cli'});end(null);",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      expect((yield* f.calls).filter((call) => call.request?.command === "message")).toEqual([]);
+    }),
+  ),
+);
+
+it.live("does not re-wake on messages buffered behind a probe-carried completion", () =>
+  live(
+    Effect.gen(function* () {
+      const buffered = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        if (JSON.stringify(message).includes("duplicate-buffered"))
+          Deferred.doneUnsafe(buffered, Effect.void);
+      });
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({
+          latest:
+            "emit({...result,turn:{...result.turn,queueItemId:'web-B',startSeq:33,endSeq:50}});",
+          message:
+            "ack(req);seq=31;end();await wait('probe');emit({phase:'code',type:'status',status:'task_updated',task:result.task});await wait('duplicate');seq=32;trace('user_message',{text:'Already completed',queueItemId:'web-B',source:'web'});emit({phase:'code',type:'duplicate-buffered'});",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.terminal;
+        yield* f.mark("probe");
+        yield* Queue.take(f.wakes);
+        yield* f.mark("duplicate");
+        yield* Deferred.await(buffered);
+        const next = nextTurn(f.turnInput, 2);
+        yield* f.runtime.startTurn({
+          ...next,
+          message: { ...next.message, createdBy: "agent", creationSource: "provider" },
+        });
+        expect((yield* f.terminal).status).toBe("completed");
+        assert(f.runtime.hasPendingBackgroundWork);
+        expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
+        expect(yield* Queue.size(f.wakes)).toBe(0);
+      }).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
+      );
+    }),
+  ),
 );
