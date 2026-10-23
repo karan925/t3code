@@ -411,7 +411,8 @@ function selectionSupportsTextGeneration(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
-  return settings.providerInstances[selection.instanceId]?.driver !== ACP_REGISTRY_DRIVER;
+  const driver = settings.providerInstances[selection.instanceId]?.driver;
+  return driver !== ACP_REGISTRY_DRIVER && driver !== ProviderDriverKind.make("coderabbit");
 }
 
 function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {

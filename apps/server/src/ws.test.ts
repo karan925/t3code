@@ -1,7 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  AcpRegistryImportSessionInput,
+  AcpRegistryImportSessionResult,
   AuthSessionId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ServerProvider,
   EnvironmentId,
   ProjectId,
   ThreadId,
@@ -16,10 +21,12 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
+import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { Headers } from "effect/http";
-import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
+import { Rpc, RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -58,6 +65,7 @@ import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.t
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
@@ -113,6 +121,8 @@ import {
   WS_RPC_SERVER_OPTIONS,
   withLateEditorConfig,
 } from "./ws.ts";
+
+const decodeServerProvider = Schema.decodeSync(ServerProvider);
 
 const snapshotConfig = (fields: Partial<ServerConfig>) =>
   ({ availableEditors: [], settings: {}, ...fields }) as unknown as ServerConfig;
@@ -291,6 +301,13 @@ it.live.each(["thread", "shell"] as const)(
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+  Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+  Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+  Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+  Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+  Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+  Layer.mock(UsageLimitSources.UsageLimitSources)({}),
   Layer.mock(CodeRabbitCli.CodeRabbitCli)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),
@@ -625,5 +642,117 @@ it.effect("thread resume across compacted history keeps message order and final 
         Layer.provideMerge(ReplayTestLayer),
       ),
     ),
+  ),
+);
+
+it.effect.each([
+  { driver: "coderabbit", modes: ["full-access"] as const, expected: "full-access" },
+  {
+    driver: "acpRegistry",
+    modes: ["approval-required", "full-access"] as const,
+    expected: "approval-required",
+  },
+])("imports $driver sessions in a supported runtime mode", ({ driver, modes, expected }) =>
+  Effect.gen(function* () {
+    const instanceId = ProviderInstanceId.make(driver);
+    const projectId = ProjectId.make("project:session-import");
+    const launched = yield* Deferred.make<ThreadLaunchService.ThreadLaunchInput>();
+    const response = yield* Deferred.make<Exit.Exit<AcpRegistryImportSessionResult, unknown>>();
+    const snapshot = decodeServerProvider({
+      instanceId,
+      driver,
+      enabled: true,
+      installed: true,
+      version: "0.9.0",
+      checkedAt: "2026-10-22T00:00:00.000Z",
+      status: "ready",
+      auth: { status: "authenticated" },
+      models: [
+        { slug: "default", name: "Default", isDefault: true, isCustom: false, capabilities: null },
+      ],
+      supportedRuntimeModes: modes,
+      nativeSessions: { canList: true, canLoad: false, canResume: true, canDelete: false },
+    });
+    const instance = {
+      instanceId,
+      driverKind: ProviderDriverKind.make(driver),
+      snapshot: { getSnapshot: Effect.succeed(snapshot) },
+      acpSessionManagement: {},
+    } as unknown as ProviderInstance;
+    const services = Layer.mergeAll(
+      layerUnusedConfigRpcServices,
+      Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+        getInstance: () => Effect.succeed(instance),
+      }),
+      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([snapshot]) }),
+      Layer.mock(ProjectService.ProjectService)({
+        getById: () =>
+          Effect.succeedSome({ id: projectId, workspaceRoot: "/tmp/session-import" } as never),
+      }),
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
+      Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+        launch: (input) => Deferred.succeed(launched, input).pipe(Effect.as({} as never)),
+      }),
+      Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({ enqueueCommand: (effect) => effect }),
+      Layer.mock(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator)({
+        withSessionMutation: (effect) => effect,
+      }),
+    );
+    const server = yield* RpcServer.makeNoSerialization(
+      RpcGroup.make(
+        Rpc.make(WS_METHODS.serverImportAcpRegistrySession, {
+          payload: AcpRegistryImportSessionInput,
+          success: AcpRegistryImportSessionResult,
+        }),
+      ),
+      {
+        ...WS_RPC_SERVER_OPTIONS,
+        onFromServer: (message) =>
+          message._tag === "Exit"
+            ? Deferred.succeed(response, message.exit).pipe(Effect.asVoid)
+            : Effect.void,
+      },
+    ).pipe(
+      Effect.provide(
+        layerWsRpc(
+          {
+            sessionId: AuthSessionId.make("session-import"),
+            subject: "session-import",
+            method: "browser-session-cookie",
+            scopes: [],
+          },
+          {},
+          {},
+          yield* PreviewAutomationBroker.PreviewAutomationBroker,
+          yield* ServerBrowser.ServerBrowser,
+        ).pipe(Layer.provide(services)),
+      ),
+    );
+    yield* server.write(0, {
+      _tag: "Request",
+      id: RpcMessage.RequestId("import"),
+      tag: WS_METHODS.serverImportAcpRegistrySession,
+      payload: { instanceId, projectId, sessionId: "native-task" },
+      headers: Headers.empty,
+    });
+    const result = yield* Deferred.await(response);
+    assert.isTrue(Exit.isSuccess(result));
+    const input = yield* Deferred.await(launched);
+    assert.equal(input.runtimeMode, expected);
+    assert.equal(input.title, "Imported session");
+    assert.equal(input.modelSelection.model, "default");
+    assert.equal(input.importedNativeThread?.ref.driver, driver);
+    assert.equal(input.importedNativeThread?.ref.nativeId, "native-task");
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.fresh(layerConfigSources),
+        Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+        Layer.mock(ServerBrowser.ServerBrowser)({}),
+      ),
+    ),
+    Effect.scoped,
   ),
 );

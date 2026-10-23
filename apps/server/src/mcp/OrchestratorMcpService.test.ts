@@ -2277,6 +2277,30 @@ describe("OrchestratorMcpService provider resolution", () => {
   );
 
   describe("resolveRuntimeMode", () => {
+    const codeRabbit = {
+      modelSelection: { instanceId: ProviderInstanceId.make("coderabbit"), model: "default" },
+      supportedRuntimeModes: ["full-access"] as const,
+    };
+
+    it.effect("refuses inheritance when every target mode exceeds the parent", () =>
+      Effect.gen(function* () {
+        for (const mode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+          const error = yield* OrchestratorMcpService.resolveRuntimeMode(
+            mode,
+            "inherit",
+            codeRabbit,
+          ).pipe(Effect.flip);
+          assert.equal(error.code, "invalid_request");
+          assert.include(error.message, mode);
+          assert.include(error.message, "full-access");
+          assert.include(error.message, "coderabbit");
+        }
+        assert.equal(
+          yield* OrchestratorMcpService.resolveRuntimeMode("full-access", "inherit", codeRabbit),
+          "full-access",
+        );
+      }),
+    );
     const muse = {
       modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "muse-model" },
       supportedRuntimeModes: ["approval-required", "full-access"] as const,
