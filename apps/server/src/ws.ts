@@ -1374,7 +1374,7 @@ export const layerWsRpc = (
         if (instance.acpSessionManagement === undefined) {
           return yield* new AcpRegistryOperationError({
             reason: "session_list_unsupported",
-            message: `Provider instance ${instanceId} does not expose ACP session management.`,
+            message: `Provider instance ${instanceId} does not expose session management.`,
           });
         }
         return { instance, manager: instance.acpSessionManagement };
@@ -1417,7 +1417,7 @@ export const layerWsRpc = (
                 (cause) =>
                   new AcpRegistryOperationError({
                     reason: "session_import_failed",
-                    message: "Could not inspect existing imported ACP sessions.",
+                    message: "Could not inspect existing imported sessions.",
                     cause,
                   }),
               ),
@@ -1442,7 +1442,7 @@ export const layerWsRpc = (
             ) {
               return yield* new AcpRegistryOperationError({
                 reason: "session_resume_unsupported",
-                message: "The ACP agent cannot load or resume native sessions.",
+                message: "The provider cannot load or resume native sessions.",
               });
             }
             const threadId = importedAcpThreadId({
@@ -1455,7 +1455,7 @@ export const layerWsRpc = (
                 (cause) =>
                   new AcpRegistryOperationError({
                     reason: "session_import_failed",
-                    message: "Could not inspect the imported ACP session mapping.",
+                    message: "Could not inspect the imported session mapping.",
                     cause,
                   }),
               ),
@@ -1476,9 +1476,14 @@ export const layerWsRpc = (
                   commandId,
                   threadId,
                   projectId: input.projectId,
-                  title: input.title ?? "Imported ACP session",
+                  title: input.title ?? "Imported session",
                   modelSelection: { instanceId: input.instanceId, model },
-                  runtimeMode: "approval-required",
+                  runtimeMode:
+                    providerSnapshot.supportedRuntimeModes?.find(
+                      (mode) => mode === "approval-required",
+                    ) ??
+                    providerSnapshot.supportedRuntimeModes?.[0] ??
+                    "approval-required",
                   interactionMode: "default",
                   workspaceStrategy: { type: "root" },
                   importedNativeThread: {
@@ -1504,7 +1509,7 @@ export const layerWsRpc = (
                   (cause) =>
                     new AcpRegistryOperationError({
                       reason: "session_import_failed",
-                      message: "Could not inspect the imported ACP session after launch failed.",
+                      message: "Could not inspect the imported session after launch failed.",
                       cause,
                     }),
                 ),
@@ -1512,7 +1517,7 @@ export const layerWsRpc = (
               if (racedImport !== null) return { threadId, imported: false } as const;
               return yield* new AcpRegistryOperationError({
                 reason: "session_import_failed",
-                message: "Could not create a T3 thread for the ACP session.",
+                message: "Could not create a T3 thread for the session.",
                 cause: launched.failure,
               });
             }

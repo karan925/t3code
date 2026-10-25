@@ -1,7 +1,16 @@
 {
   "version": 1,
-  "updatedAt": "2026-10-19T07:21:38Z",
+  "updatedAt": "2026-10-22T00:00:00Z",
   "compatibility": [
+    {
+      "driver": "coderabbit",
+      "t3CodeRange": ">=0.1.1",
+      "recommendedRange": ">=0.9.0",
+      "ranges": [
+        { "range": ">=0.9.0", "status": "supported" },
+        { "range": "<0.9.0", "status": "unsupported" }
+      ]
+    },
     {
       "driver": "codex",
       "t3CodeRange": ">=0.0.44",

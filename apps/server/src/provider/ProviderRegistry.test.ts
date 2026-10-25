@@ -78,7 +78,7 @@ const disabledDefaultSlots = (
   ...drivers: ReadonlyArray<string>
 ): ContractServerSettings["providerInstances"] =>
   Object.fromEntries(
-    drivers.map((driver) => [
+    ["coderabbit", ...drivers].map((driver) => [
       ProviderInstanceId.make(driver),
       { driver: ProviderDriverKind.make(driver), enabled: false },
     ]),
@@ -1986,6 +1986,14 @@ it.layer(
           const providers = yield* registry.getProviders;
           const ghost = providers.find((provider) => provider.instanceId === "ghost_main");
 
+          const codeRabbit = providers.find((provider) => provider.instanceId === "coderabbit");
+          assert.strictEqual(codeRabbit?.driver, "coderabbit");
+          assert.strictEqual(codeRabbit?.enabled, false);
+          assert.strictEqual(codeRabbit?.status, "disabled");
+          assert.deepEqual(
+            codeRabbit?.models.map((model) => model.slug),
+            ["default"],
+          );
           assert.notStrictEqual(ghost, undefined);
           assert.strictEqual(ghost?.driver, "ghostDriver");
           assert.strictEqual(ghost?.availability, "unavailable");

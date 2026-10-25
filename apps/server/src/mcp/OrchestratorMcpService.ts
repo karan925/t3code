@@ -627,16 +627,22 @@ export function resolveRuntimeMode(
     return Effect.fail(
       failure(
         "invalid_request",
-        `Provider ${target?.modelSelection.instanceId} does not offer runtime mode ${resolved}, so it would run as approval-required. Use one of: ${supported.join(", ")}.`,
+        `Provider ${target?.modelSelection.instanceId} does not offer runtime mode ${resolved}. Supported modes: ${supported.join(", ")}.`,
       ),
     );
   }
-  return Effect.succeed(
-    supported
-      .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
-      .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0] ??
-      "approval-required",
-  );
+  const compatibleMode = supported
+    .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
+    .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0];
+  if (compatibleMode === undefined) {
+    return Effect.fail(
+      failure(
+        "invalid_request",
+        `Provider ${target?.modelSelection.instanceId} offers no runtime mode within parent mode ${parentMode}. Supported modes: ${supported.join(", ")}.`,
+      ),
+    );
+  }
+  return Effect.succeed(compatibleMode);
 }
 
 export function resolveInteractionMode(

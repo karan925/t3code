@@ -20,6 +20,9 @@ not prevent the agent from asking questions about the task.
 
 ## Provider differences
 
+[CodeRabbit](./providers-coderabbit.md) offers **Full access** only. Tasks run in its cloud
+environment, where T3 Code cannot enforce a local sandbox or forward tool approval requests.
+
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
 **Auto** uses automatic review on Codex, Claude, Cursor, and Grok; providers without an equivalent,
 including OpenCode and Antigravity, fall back to asking. On Grok, commands its review blocks come
