@@ -2,12 +2,20 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { CodeRabbitSettings } from "../settings.ts";
 import { CloudWorkspaceError, verifyCloudWorkspace } from "./workspace.ts";
 
@@ -80,6 +88,132 @@ const expectRejection = Effect.fn("CodeRabbitWorkspaceTest.expectRejection")(fun
 });
 
 describe("CodeRabbit source workspace", () => {
+  it.effect("gives push its full 60 seconds after slow authentication and remote lookup", () =>
+    Effect.gen(function* () {
+      const authenticated = yield* Deferred.make<void>();
+      const lookedUp = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const started = yield* Queue.unbounded<ReadonlyArray<string>>();
+      const steps = [
+        {
+          command: "git",
+          args: ["remote", "get-url", "origin"],
+          stdout: "git@github.com:example/repo.git\n",
+          exit: Effect.void,
+        },
+        {
+          command: "/fake/cr",
+          args: ["auth", "status", "--agent"],
+          stdout: JSON.stringify({
+            type: "status",
+            phase: "auth",
+            authenticated: true,
+            provider: "github",
+            currentOrg: { name: "example" },
+          }),
+          exit: Deferred.await(authenticated),
+        },
+        {
+          command: "git",
+          args: ["symbolic-ref", "--quiet", "--short", "HEAD"],
+          stdout: "unpublished-branch\n",
+          exit: Effect.void,
+        },
+        {
+          command: "git",
+          args: ["rev-parse", "HEAD"],
+          stdout: "abc123\n",
+          exit: Effect.void,
+        },
+        {
+          command: "git",
+          args: ["ls-remote", "--heads", "origin", "refs/heads/unpublished-branch"],
+          stdout: "",
+          exit: Deferred.await(lookedUp),
+        },
+        {
+          command: "git",
+          args: [
+            "push",
+            "-u",
+            "origin",
+            "refs/heads/unpublished-branch:refs/heads/unpublished-branch",
+          ],
+          stdout: "",
+          exit: Effect.never,
+        },
+      ];
+      const commands: Array<{ command: string; args: ReadonlyArray<string> }> = [];
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          assert(command._tag === "StandardCommand");
+          const step = steps[commands.length];
+          assert(step, "Unexpected command after push");
+          const invocation = { command: command.command, args: command.args };
+          commands.push(invocation);
+          expect(invocation).toEqual({ command: step.command, args: step.args });
+          return ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(123),
+            exitCode: Queue.offer(started, command.args).pipe(
+              Effect.andThen(step.exit),
+              Effect.as(ChildProcessSpawner.ExitCode(0)),
+            ),
+            isRunning: Effect.succeed(true),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.drain,
+            stdout: Stream.encodeText(Stream.make(step.stdout)),
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          });
+        }),
+      );
+      const verification = yield* verifyCloudWorkspace(
+        "/fake/repo",
+        {},
+        {
+          binaryPath: "/fake/cr",
+          autoPushBranch: true,
+        },
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(HostProcess.Platform, "linux"),
+        Effect.result,
+        Effect.ensuring(Deferred.succeed(completed, undefined)),
+        Effect.forkChild,
+      );
+      for (const step of steps.slice(0, 2)) {
+        expect(yield* Queue.take(started)).toEqual(step.args);
+      }
+      yield* TestClock.adjust("9 seconds");
+      yield* Deferred.succeed(authenticated, undefined);
+      for (const step of steps.slice(2, 5)) {
+        expect(yield* Queue.take(started)).toEqual(step.args);
+      }
+      yield* TestClock.adjust("29 seconds");
+      yield* Deferred.succeed(lookedUp, undefined);
+      expect(yield* Queue.take(started)).toEqual(steps[5]!.args);
+
+      // Slow preflight must not consume the push's own 60-second budget.
+      yield* TestClock.adjust("52 seconds");
+      expect(yield* Deferred.isDone(completed)).toBe(false);
+      yield* TestClock.adjust("7999 millis");
+      expect(yield* Deferred.isDone(completed)).toBe(false);
+      yield* TestClock.adjust("1 millis");
+      expect(yield* Deferred.isDone(completed)).toBe(true);
+      const result = yield* Fiber.join(verification);
+      assert(Result.isFailure(result));
+      assert(isCloudWorkspaceError(result.failure));
+      expect(result.failure.reason).toBe("push_failed");
+      expect(result.failure.branch).toBe("unpublished-branch");
+      expect(result.failure.message).toContain("Push `unpublished-branch` manually");
+      expect(result.failure.message).toContain("then send your message again");
+      expect(commands).toEqual(steps.map(({ command, args }) => ({ command, args })));
+    }),
+  );
+
   it.live("accepts a clean branch whose commit is published on origin", () =>
     Effect.scoped(
       Effect.gen(function* () {

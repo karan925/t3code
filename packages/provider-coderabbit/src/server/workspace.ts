@@ -112,7 +112,6 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
       (yield* requiredGit(["status", "--porcelain", "--untracked-files=normal"])) !== "";
     return { branch, dirty, pushed, localDiffers: remote.split(/\s+/u)[0] !== head };
   }).pipe(
-    Effect.timeout("90 seconds"),
     Effect.mapError((cause) =>
       isCloudWorkspaceError(cause) ? cause : new CloudWorkspaceError({ reason: "git", cause }),
     ),
