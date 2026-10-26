@@ -40,8 +40,10 @@ import {
 import * as Stream from "effect/Stream";
 import * as Path from "effect/Path";
 import { makeCodeRabbitAdapterV2 } from "./adapter.ts";
+import { CodeRabbitSettings } from "../settings.ts";
 
 const decodeAdapterEvent = Schema.decodeEffect(ProviderAdapter.ProviderAdapterV2Event);
+const decodeSettings = Schema.decodeEffect(CodeRabbitSettings);
 const THREAD = ThreadId.make("cloud-test");
 const INSTANCE = ProviderInstanceId.make("coderabbit");
 const SESSION = ProviderSessionId.make("cloud-session");
@@ -120,6 +122,10 @@ interface FixtureOptions {
   readonly latest?: string;
   readonly create?: string;
   readonly unpublished?: boolean;
+  readonly localDiffers?: boolean;
+  readonly autoPushBranch?: boolean;
+  readonly originUrl?: string;
+  readonly auth?: string;
   readonly show?: string;
   readonly preflight?: string;
 }
@@ -219,6 +225,7 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     };
     const ack=(req,fields={})=>emit({phase:'code',type:'response',id:req.id,ok:true,status:'message_sent',clientOperationId:'client-op-1',queueItemId:'op-1',...fields});
     ${syncSource}
+    if(args[0]==='auth') { ${options.auth ?? "emit({type:'status',phase:'auth',authenticated:true,provider:'github',currentOrg:{name:'owner'}});"} process.exit(0); }
     if(args[1]==='new') { const prompt=readFileSync(0,'utf8');appendFileSync(${JSON.stringify(log)},JSON.stringify({prompt})+'\\n'); ${script(options.create ?? "")} emit({phase:'code',type:'complete',status:'task_submitted',taskId:'task-123',url:result.task.url,created:true,task:{...result.task,turnStatus:'running'},warnings:[]});process.exit(0); }
     if(!args.includes('--interactive')){${script(options.latest ?? "emit(result);")}process.exit(0);}
     ${script(options.beforeReady ?? "")}
@@ -247,16 +254,22 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     appendFileSync(${JSON.stringify(log)},JSON.stringify({git:args})+'\\n');
     if(args[0]==='symbolic-ref') console.log('main');
     if(args[0]==='rev-parse') console.log('abcdef');
+    if(args[0]==='remote') console.log(${JSON.stringify(options.originUrl ?? "https://example.test/owner/repo.git")});
     ${syncSource}
     ${script(options.preflight ?? "")}
-    if(args[0]==='ls-remote') console.log('${options.unpublished ? "fedcba" : "abcdef"}\\trefs/heads/main');
+    if(args[0]==='push') writeFileSync(signal('pushed'),'1');
+    if(args[0]==='ls-remote' && (!${options.unpublished ?? false} || existsSync(signal('pushed')))) console.log('${options.localDiffers ? "fedcba" : "abcdef"}\\trefs/heads/main');
     if(args[0]==='status') console.log(' M changed.ts');
   `,
   });
   const wakes = yield* Queue.unbounded<ProviderContinuationRequest>();
   const adapter = yield* makeCodeRabbitAdapterV2({
     instanceId: INSTANCE,
-    settings: { enabled: true, binaryPath: binary },
+    settings: yield* decodeSettings({
+      enabled: true,
+      binaryPath: binary,
+      ...(options.autoPushBranch === undefined ? {} : { autoPushBranch: options.autoPushBranch }),
+    }),
     environment: { ...env, PATH: `${dir}${path.sep === "\\" ? ";" : ":"}${env.PATH ?? ""}` },
   }).pipe(
     Effect.provideService(ProviderContinuationRequests, {
@@ -460,6 +473,7 @@ it.live(
         expect((yield* f.terminal).status).toBe("completed");
         const calls = yield* f.calls;
         expect(calls.filter((call) => call.git).map((call) => call.git)).toEqual([
+          ["remote", "get-url", "origin"],
           ["symbolic-ref", "--quiet", "--short", "HEAD"],
           ["rev-parse", "HEAD"],
           ["ls-remote", "--heads", "origin", "refs/heads/main"],
@@ -502,12 +516,135 @@ it.live(
 it.live("rejects an unpublished new task before invoking the CodeRabbit CLI", () =>
   live(
     Effect.gen(function* () {
-      const f = yield* fixture({ initialTask: null, unpublished: true });
+      const f = yield* fixture({ initialTask: null, unpublished: true, autoPushBranch: false });
       yield* f.runtime.startTurn(f.turnInput);
       const terminal = yield* f.terminal;
       expect(terminal.status).toBe("failed");
       expect(terminal.failure?.message).toContain("Push `main` first");
       expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+      expect((yield* f.calls).some((call) => call.git?.[0] === "push")).toBe(false);
+    }),
+  ),
+);
+
+it.live("starts from an existing origin branch that differs from the local copy", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({ initialTask: null, localDiffers: true });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      expect((yield* f.calls).some((call) => call.git?.[0] === "push")).toBe(false);
+      expect(f.allEvents).toContainEqual(
+        expect.objectContaining({
+          type: "message.updated",
+          message: expect.objectContaining({
+            text: `Working in CodeRabbit: ${task.url}\nCodeRabbit started from \`main\` on origin, which differs from your local copy; unpushed local commits are not included.\nLocal uncommitted changes were not uploaded.`,
+          }),
+        }),
+      );
+    }),
+  ),
+);
+
+it.live("publishes a missing branch by default before creating the cloud task", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({ initialTask: null, unpublished: true });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      const calls = yield* f.calls;
+      const push = calls.findIndex((call) => call.git?.[0] === "push");
+      expect(calls[push]?.git).toEqual(["push", "-u", "origin", "refs/heads/main:refs/heads/main"]);
+      expect(calls.filter((call) => call.git?.[0] === "ls-remote")).toHaveLength(2);
+      expect(push).toBeLessThan(calls.findIndex((call) => call.args?.[1] === "new"));
+      expect(f.allEvents).toContainEqual(
+        expect.objectContaining({
+          type: "message.updated",
+          message: expect.objectContaining({
+            text: `Working in CodeRabbit: ${task.url}\nPushed \`main\` to origin so CodeRabbit could start from it.\nLocal uncommitted changes were not uploaded.`,
+          }),
+        }),
+      );
+    }),
+  ),
+);
+
+it.live("does not create a task when publishing the branch fails", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        unpublished: true,
+        preflight: "if(args[0]==='push'){console.error('remote: push denied');process.exit(1);}",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      const terminal = yield* f.terminal;
+      expect(terminal.status).toBe("failed");
+      expect(terminal.failure?.message).toContain("could not push `main` to origin");
+      expect(terminal.failure?.message).toContain("Push `main` manually");
+      expect(terminal.failure?.message).toContain("push denied");
+      expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+    }),
+  ),
+);
+
+it.live.each([
+  "git@github.com:owner/repo.git",
+  "ssh://git@github.com/owner/repo",
+  "https://github.com/owner/repo.git",
+])("rejects a mismatched CodeRabbit organization before pushing: %s", (originUrl) =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        unpublished: true,
+        originUrl,
+        auth: "emit({type:'status',phase:'auth',authenticated:true,provider:'github',currentOrg:{name:'other-org'}});",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      const terminal = yield* f.terminal;
+      expect(terminal.status).toBe("failed");
+      expect(terminal.failure?.message).toBe(
+        "CodeRabbit CLI is using the `other-org` organization, but this repository belongs to `owner`. Run `cr auth logout && cr auth login` on this machine, choose `owner`, then send your message again.",
+      );
+      const calls = yield* f.calls;
+      expect(calls.filter((call) => call.git).map((call) => call.git)).toEqual([
+        ["remote", "get-url", "origin"],
+      ]);
+      expect(calls.filter((call) => call.args).map((call) => call.args)).toEqual([
+        ["auth", "status", "--agent"],
+      ]);
+    }),
+  ),
+);
+
+it.live.each([
+  ["case-insensitive matching", "https://github.com/OWNER/repo", undefined],
+  ["non-GitHub origin", "https://gitlab.com/other/repo", undefined],
+  ["unparsable origin", "https://github.com/owner", undefined],
+  ["status failure", "git@github.com:owner/repo", "process.exit(1);"],
+  ["malformed status", "git@github.com:owner/repo", "console.log('not JSON');"],
+  [
+    "other provider",
+    "git@github.com:owner/repo",
+    "emit({type:'status',phase:'auth',authenticated:true,provider:'gitlab',currentOrg:{name:'other'}});",
+  ],
+  [
+    "missing org",
+    "git@github.com:owner/repo",
+    "emit({type:'status',phase:'auth',authenticated:true,provider:'github'});",
+  ],
+] as const)("allows task creation with %s", ([_name, originUrl, auth]) =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        originUrl,
+        ...(auth === undefined ? {} : { auth }),
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      expect((yield* f.calls).some((call) => call.args?.[1] === "new")).toBe(true);
     }),
   ),
 );
@@ -1178,11 +1315,17 @@ it.live("classifies quota failures and emits the matching error item and termina
         threadDisposition: "reusable",
       });
       assert(terminal.status === "failed");
-      const error = f.allEvents.find(
+      const errors = f.allEvents.filter(
         (event) => event.type === "turn_item.updated" && event.turnItem.type === "error",
       );
-      expect(error).toMatchObject({
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({
         turnItem: {
+          id: IdAllocator.derive.turnItemFromProviderItem({
+            driver: f.runtime.driver,
+            nativeItemId: `terminal-failure:${terminal.providerTurnId}`,
+          }),
+          nativeItemRef: { nativeId: `terminal-failure:${terminal.providerTurnId}` },
           type: "error",
           status: "failed",
           ordinal: terminal.failureItemOrdinal,

@@ -399,7 +399,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             type: "turn_item.updated",
             driver: DRIVER,
             turnItem: {
-              ...itemBase(turn, `${turn.providerTurn.id}:failure`, at),
+              ...itemBase(turn, `terminal-failure:${turn.providerTurn.id}`, at),
               type: "error",
               status: "failed",
               failure,
@@ -1275,9 +1275,11 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               return;
             }
             if (taskId === null) {
-              const workspace = yield* verifyCloudWorkspace(cwd, options.environment).pipe(
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              );
+              const workspace = yield* verifyCloudWorkspace(
+                cwd,
+                options.environment,
+                options.settings,
+              ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
               if (turn.stopRequested || turn.finished) return;
               turn.submitted = true;
               task = yield* createTask({ ...taskOptions, prompt: text }).pipe(
@@ -1293,7 +1295,20 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               yield* say(
                 turn,
                 "cloud-task",
-                `Working in CodeRabbit: ${task.url}${workspace?.dirty ? "\nLocal uncommitted changes were not uploaded." : ""}`,
+                [
+                  `Working in CodeRabbit: ${task.url}`,
+                  ...(workspace.pushed
+                    ? [
+                        `Pushed \`${workspace.branch}\` to origin so CodeRabbit could start from it.`,
+                      ]
+                    : []),
+                  ...(workspace.localDiffers
+                    ? [
+                        `CodeRabbit started from \`${workspace.branch}\` on origin, which differs from your local copy; unpushed local commits are not included.`,
+                      ]
+                    : []),
+                  ...(workspace.dirty ? ["Local uncommitted changes were not uploaded."] : []),
+                ].join("\n"),
               );
               yield* Deferred.succeed(turn.messageReceipt, undefined);
               yield* ensureInteractive();
@@ -1387,11 +1402,13 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                 yield* finish(
                   turn,
                   "failed",
-                  /auth/i.test(cause.message)
-                    ? "Run `cr auth login` on the T3 server host."
-                    : turn.taskId === null && turn.submitted
-                      ? `${cause.message} Check your CodeRabbit task list at app.coderabbit.ai before retrying.`
-                      : cause.message,
+                  cause._tag === "CodeRabbitWorkspaceError"
+                    ? cause.message
+                    : /auth/i.test(cause.message)
+                      ? "Run `cr auth login` on the T3 server host."
+                      : turn.taskId === null && turn.submitted
+                        ? `${cause.message} Check your CodeRabbit task list at app.coderabbit.ai before retrying.`
+                        : cause.message,
                 );
               }),
             ),

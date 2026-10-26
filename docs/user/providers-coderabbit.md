@@ -6,7 +6,9 @@ thread. This provider is **Beta** and disabled by default.
 ## Set up CodeRabbit
 
 Install CodeRabbit CLI 0.9.0 or newer on the machine running the T3 Code server, then run
-`cr auth login` there. Open **Settings → Providers**, select that environment, and enable
+`cr auth login` there and choose the GitHub organization that owns your repository. If the CLI is
+using a different organization, run `cr auth logout && cr auth login` on that machine and choose
+the repository's owner. Open **Settings → Providers**, select that environment, and enable
 **CodeRabbit**. If needed, set its **Binary path** to the host's `cr` executable. T3 Code uses
 that host login; separate accounts need separate T3 environments.
 
@@ -16,9 +18,14 @@ messages continue the same task. Delegation to CodeRabbit also requires the pare
 
 ## Work with cloud tasks
 
-Tasks start from the pushed branch on `origin`. Commit and push the changes the task needs before
-sending it. Dirty files and unpushed commits are not uploaded. T3 Code warns when local uncommitted
-changes were not uploaded. Local attachments are not uploaded either.
+Tasks start from the current branch on `origin`. By default, T3 Code pushes the branch if it does
+not exist on `origin` yet, including new worktree branches. Turn off **Automatically push new
+branches** in CodeRabbit's provider settings to publish branches manually instead.
+
+Existing origin branches are used as they are, even when your local copy differs. Commit and push
+any changes the task needs before sending it. T3 Code reports when it publishes a branch, when the
+origin branch differs from your local copy, and when local uncommitted changes were not uploaded.
+Dirty files, unpushed commits on existing branches, and local attachments are not uploaded.
 
 Cloud edits stay in the remote task. Use CodeRabbit's `cr code push <task>` command or its web delivery
 flow to publish them, then fetch and review the changes locally.
