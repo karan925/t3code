@@ -1143,7 +1143,9 @@ it.live(
         ]);
         expect(
           f.allEvents.some(
-            (event) => event.type === "message.updated" && event.message.text === "Done in cloud",
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text.startsWith("Done in cloud\n\n---"),
           ),
         ).toBe(true);
       }),
@@ -1168,7 +1170,9 @@ it.live("reads the correlated latest turn when task_updated reports terminal sta
       ).toHaveLength(2);
       expect(
         f.allEvents.some(
-          (event) => event.type === "message.updated" && event.message.text === "Done in cloud",
+          (event) =>
+            event.type === "message.updated" &&
+            event.message.text.startsWith("Done in cloud\n\n---"),
         ),
       ).toBe(true);
     }),
@@ -1243,7 +1247,7 @@ it.live(
           f.allEvents.some(
             (event) =>
               event.type === "message.updated" &&
-              event.message.text === "Web continuation completed",
+              event.message.text.startsWith("Web continuation completed\n\n---"),
           ),
         ).toBe(true);
       }),
@@ -1642,7 +1646,7 @@ it.live(
         );
         expect(texts).toContain("Message sent from the CodeRabbit web app: Queued web request B");
         expect(texts).toContain("Turn B output");
-        expect(texts).toContain("Turn B completed");
+        expect(texts.some((text) => text.startsWith("Turn B completed\n\n---"))).toBe(true);
         expect(
           (yield* f.calls).flatMap((call) =>
             call.request && call.request.command !== "show" ? [call.request.command] : [],
@@ -2046,13 +2050,19 @@ it.live("dispatches two complete buffered web turns as separate continuations", 
           expect.objectContaining({ runId: turnB.runId, text: "Web output B" }),
         );
         expect(messages).toContainEqual(
-          expect.objectContaining({ runId: turnB.runId, text: "B completed" }),
+          expect.objectContaining({
+            runId: turnB.runId,
+            text: expect.stringMatching(/^B completed\n\n---/u),
+          }),
         );
         expect(messages).toContainEqual(
           expect.objectContaining({ runId: turnC.runId, text: "Web output C" }),
         );
         expect(messages).toContainEqual(
-          expect.objectContaining({ runId: turnC.runId, text: "C completed" }),
+          expect.objectContaining({
+            runId: turnC.runId,
+            text: expect.stringMatching(/^C completed\n\n---/u),
+          }),
         );
         expect(
           messages.some(
@@ -2568,6 +2578,31 @@ it.live("Stop during a push kills preflight before publishing the branch", () =>
   ),
 );
 
+it.live("ends the turn with the streamed reply and its task footer as the last message", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        message: "ack(req);trace('agent_message',{text:'Done in cloud'});end();",
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      const messages = f.allEvents.flatMap((event) =>
+        event.type === "message.updated" ? [event.message] : [],
+      );
+      const streamed = messages.find((message) => message.text === "Done in cloud");
+      assert(streamed);
+      const last = messages.at(-1);
+      assert(last);
+      // The reply is rewritten in place with the footer, not followed by a separate summary.
+      expect(last.id).toBe(streamed.id);
+      expect(last.text).toMatch(/^Done in cloud\n\n---\n\n- CodeRabbit task: /u);
+      expect(messages.filter((message) => message.text.startsWith("- CodeRabbit task:"))).toEqual(
+        [],
+      );
+    }),
+  ),
+);
+
 it.live.each([true, false])("refreshes delivery metadata with show (success=%s)", (success) =>
   live(
     Effect.gen(function* () {
@@ -2584,7 +2619,7 @@ it.live.each([true, false])("refreshes delivery metadata with show (success=%s)"
       );
       assert(delivery?.type === "message.updated");
       expect(delivery.message.text).toContain(
-        success ? "Working branch: fresh-branch" : "Working branch: coderabbit/test",
+        success ? "Working branch: `fresh-branch`" : "Working branch: `coderabbit/test`",
       );
       expect(delivery.message.text).toContain(
         success ? "delivery: delivered" : "delivery: pending",
@@ -2763,7 +2798,10 @@ it.live.each(["probe", "status"])(
           expect(f.allEvents).toContainEqual(
             expect.objectContaining({
               type: "message.updated",
-              message: expect.objectContaining({ runId: next.runId, text: "Recovered web reply" }),
+              message: expect.objectContaining({
+                runId: next.runId,
+                text: expect.stringMatching(/^Recovered web reply\n\n---/u),
+              }),
             }),
           );
           expect(
@@ -2926,7 +2964,9 @@ it.live("settles a restarted unacknowledged message from terminal history with i
       expect(f.allEvents).toContainEqual(
         expect.objectContaining({
           type: "message.updated",
-          message: expect.objectContaining({ text: "Recovered terminal reply" }),
+          message: expect.objectContaining({
+            text: expect.stringMatching(/^Recovered terminal reply\n\n---/u),
+          }),
         }),
       );
       expect((yield* f.calls).filter((call) => call.request?.command === "message")).toEqual([]);
@@ -2948,7 +2988,7 @@ it.live("falls back to cached delivery metadata after five virtual seconds of st
           expect.objectContaining({
             type: "message.updated",
             message: expect.objectContaining({
-              text: expect.stringContaining("Working branch: coderabbit/test"),
+              text: expect.stringContaining("Working branch: `coderabbit/test`"),
             }),
           }),
         );

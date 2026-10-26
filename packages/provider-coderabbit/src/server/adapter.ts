@@ -169,6 +169,7 @@ interface ActiveTurn {
   readonly previousHead: OrchestrationV2ProviderThread["nativeConversationHeadRef"];
   buffered: CodeEvent[];
   lastAssistantText: string | null;
+  lastAssistantKey: string | null;
   nextOrdinal: number;
   finished: boolean;
   resolvedQuestions: Set<string>;
@@ -279,6 +280,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       const say = Effect.fnUntraced(function* (turn: ActiveTurn, key: string, text: string) {
         if (!text.trim()) return;
         turn.lastAssistantText = text;
+        turn.lastAssistantKey = key;
         const at = yield* DateTime.now;
         const nativeId = `${turn.providerTurn.id}:${key}`;
         const messageId = ids.derive.messageFromProviderItem({
@@ -581,17 +583,23 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         }
 
         const text = result.finalReply ?? result.errorMessage;
-        if (text && text !== turn.lastAssistantText) yield* say(turn, "result", text);
-        yield* say(
-          turn,
-          "delivery",
-          [
-            `CodeRabbit task: ${detail?.url ?? turn.taskURL}`,
-            `Working branch: ${detail?.workingBranchName ?? "pending"}`,
-            `Patch: ${detail?.patchStatus ?? "unknown"}; delivery: ${detail?.deliveryStatus ?? "unknown"}.`,
-            `Results stay in the cloud. Deliver with \`cr code push ${turn.taskId}\` or the web app.`,
-          ].join("\n"),
-        );
+        const patchStatus = detail?.patchStatus ?? "unknown";
+        const footer = [
+          `- CodeRabbit task: ${detail?.url ?? turn.taskURL}`,
+          `- Working branch: \`${detail?.workingBranchName ?? "pending"}\``,
+          ...(patchStatus === "none"
+            ? []
+            : [
+                `- Patch: ${patchStatus}; delivery: ${detail?.deliveryStatus ?? "unknown"}. Deliver with \`cr code push ${turn.taskId}\` or the web app.`,
+              ]),
+        ].join("\n");
+        // The thread shows a turn's last message as its answer, so the reply must carry the footer.
+        // A reply already streamed from the trace is rewritten in place rather than repeated.
+        const replyKey =
+          text && text === turn.lastAssistantText && turn.lastAssistantKey
+            ? turn.lastAssistantKey
+            : "result";
+        yield* say(turn, replyKey, text ? `${text}\n\n---\n\n${footer}` : footer);
         yield* finish(
           turn,
           result.outcome === "canceled" ? "cancelled" : result.outcome,
@@ -1190,6 +1198,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             previousHead: thread.nativeConversationHeadRef,
             buffered: [],
             lastAssistantText: null,
+            lastAssistantKey: null,
             nextOrdinal: 1,
             finished: false,
             resolvedQuestions: new Set(),
