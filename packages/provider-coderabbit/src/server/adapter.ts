@@ -1466,14 +1466,16 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         interruptTurn: Effect.fn("CodeRabbit.interruptTurn")(function* (request) {
           const turn = active;
           if (!turn || turn.finished || turn.providerTurn.id !== request.providerTurnId) return;
-          turn.stopRequested = true;
           if (turn.taskId === null && !turn.submitted) {
             yield* Effect.gen(function* () {
+              // Set inside the region: a stop flag without the matching finish would strand the turn.
+              turn.stopRequested = true;
               if (turn.startFiber) yield* Fiber.interrupt(turn.startFiber);
               yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
             }).pipe(Effect.uninterruptible);
             return;
           }
+          turn.stopRequested = true;
           // Cancellation before admission can miss the queued message entirely.
           yield* Deferred.await(turn.messageReceipt);
           if (admissionUncertain)
