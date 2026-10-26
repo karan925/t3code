@@ -3,6 +3,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { createTask, fetchLatestTurn, listTasks } from "./tasks.ts";
 
@@ -46,6 +50,7 @@ it.live(
       } else if (args[1] === 'ls') {
         if (JSON.stringify(args) !== JSON.stringify(['code','ls','--agent','--repo',${JSON.stringify(cwd)}])) process.exit(93);
         output({type:'task',task:${JSON.stringify(task)}});
+        output({type:'complete',status:'tasks_listed',tasks:[${JSON.stringify(task)}]});
       } else if (args[1] === 'resume') {
         if (JSON.stringify(args) !== JSON.stringify(['code','resume','task-1','--agent'])) process.exit(94);
         output({type:'status',status:'task_selected',taskId:'task-1',url:${JSON.stringify(task.url)}});
@@ -64,19 +69,26 @@ it.live(
     ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("supports the array task-list terminal including an empty list", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-list-" });
-      const binaryPath = writeFakeCli({
-        directory: cwd,
-        name: "fake-cr",
-        source: `console.log(JSON.stringify({type:'complete',phase:'code',status:'tasks_listed',tasks:[]}));`,
-      });
-      assert.deepEqual(yield* listTasks({ binaryPath, cwd, env: process.env }), []);
-    }),
-  ).pipe(Effect.provide(NodeServices.layer)),
+it.live.each([[], [task]])(
+  "supports valid terminal task lists with unrelated extensions (%j)",
+  (tasks) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-list-" });
+        const binaryPath = writeFakeCli({
+          directory: cwd,
+          name: "fake-cr",
+          source: `
+          console.log(JSON.stringify({type:'future',phase:'code',payload:42}));
+          console.log(JSON.stringify({type:'trace',phase:'code',kind:'future_trace'}));
+          console.log(JSON.stringify({type:'complete',phase:'code',status:'future_complete'}));
+          console.log(JSON.stringify({type:'complete',phase:'code',status:'tasks_listed',tasks:${JSON.stringify(tasks)}}));
+        `,
+        });
+        assert.deepEqual(yield* listTasks({ binaryPath, cwd, env: process.env }), tasks);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("surfaces the CLI's task-list error verbatim", () =>
@@ -143,4 +155,56 @@ it.live("keeps a task submission receipt when the transport subsequently fails",
       );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const listed = { type: "complete", phase: "code", status: "tasks_listed", tasks: [task] };
+
+it.effect.each(
+  (
+    [
+      ["missing output", []],
+      ["an individual task without a receipt", [{ type: "task", phase: "code", task }]],
+      ["an unrelated terminal", [{ type: "complete", phase: "code", status: "future_complete" }]],
+      ["a missing task payload", [{ type: "task", phase: "code" }, listed]],
+      [
+        "a drifted task payload",
+        [{ type: "task", phase: "code", task: { ...task, taskId: 123 } }, listed],
+      ],
+      ["a task with a wrong phase", [{ type: "task", phase: "future", task }, listed]],
+      ["a missing tasks array", [{ type: "complete", phase: "code", status: "tasks_listed" }]],
+      ["a drifted tasks array", [{ ...listed, tasks: [task, { ...task, url: null }] }]],
+      ["a receipt with a wrong phase", [{ ...listed, phase: "future" }]],
+      ["a receipt with a wrong type", [{ ...listed, type: "status" }]],
+      ["a malformed task after the receipt", [listed, { type: "task", phase: "code", task: null }]],
+      ["a malformed receipt after the receipt", [listed, { ...listed, tasks: null }]],
+    ] as const
+  ).map(([label, frames]) => ({ label, frames })),
+)("rejects task lists with $label", ({ frames }) =>
+  Effect.gen(function* () {
+    const spawner = ChildProcessSpawner.make(() =>
+      Effect.succeed(
+        ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(123),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(false),
+          kill: () => Effect.void,
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.drain,
+          stdout: Stream.encodeText(
+            Stream.fromArray(frames.map((frame) => JSON.stringify(frame) + "\n")),
+          ),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        }),
+      ),
+    );
+    const error = yield* listTasks({ binaryPath: "/fake/cr", cwd: "/fake", env: {} }).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.flip,
+    );
+    assert.equal(error._tag, "CodeRabbitCommandError");
+  }),
 );

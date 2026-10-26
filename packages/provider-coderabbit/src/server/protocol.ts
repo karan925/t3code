@@ -1,3 +1,8 @@
+import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
+import {
+  isWindowsCommandNotFound,
+  ProviderCommandNotFoundError,
+} from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -428,6 +433,35 @@ export const consumeCodeEvents = Effect.fnUntraced(function* <E, R>(
   yield* emit();
 });
 
+export const collectCodeRabbitCommand = Effect.fn("CodeRabbit.collectCommand")(function* (
+  binaryPath: string,
+  command: ChildProcess.Command,
+) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const child = yield* spawner.spawn(command);
+  const [stdout, stderr, code] = yield* Effect.all(
+    [
+      collectUint8StreamText({ stream: child.stdout, maxBytes: 1_048_576 }),
+      collectUint8StreamText({ stream: child.stderr, maxBytes: 65_536 }),
+      child.exitCode.pipe(Effect.map(Number)),
+    ],
+    { concurrency: "unbounded" },
+  );
+  if (yield* isWindowsCommandNotFound(code, stderr.text)) {
+    return yield* new ProviderCommandNotFoundError({
+      binaryPath,
+      exitCode: code,
+      stdoutLength: stdout.bytes,
+      stderrLength: stderr.bytes,
+    });
+  }
+  // A valid-looking prefix must never stand in for the CLI's full structured output.
+  if (stdout.truncated || stdout.invalidUtf8) {
+    return yield* new CommandError({ operation: "read command output" });
+  }
+  return { stdout: stdout.text, stderr: stderr.text, code };
+}, Effect.scoped);
+
 export interface RunCodeCommandOptions {
   readonly binaryPath: string;
   readonly args: ReadonlyArray<string>;
@@ -452,6 +486,7 @@ export const runCodeCommand = Effect.fn("CodeRabbit.runCodeCommand")(function* (
           env: options.env,
           extendEnv: false,
           shell: spawn.shell,
+          forceKillAfter: "1 second",
           stdin: Stream.make(new TextEncoder().encode(options.stdin ?? "")),
         }),
       )

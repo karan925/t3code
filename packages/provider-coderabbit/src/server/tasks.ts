@@ -24,7 +24,7 @@ const commandFailure = (event: CodeEvent): CommandError | undefined => {
     return new CommandError({
       operation: "task command",
       detail: event.message,
-      ...(event.type === "error" ? { status: event.status } : {}),
+      status: event.type === "error" ? event.status : "auth_required",
     });
   return undefined;
 };
@@ -51,20 +51,29 @@ export const createTask = Effect.fn("CodeRabbit.createTask")(function* (
 });
 
 export const listTasks = Effect.fn("CodeRabbit.listTasks")(function* (options: TaskCommandOptions) {
-  let tasks: ReadonlyArray<TaskDetail> = [];
+  let tasks: ReadonlyArray<TaskDetail> | undefined;
   const code = yield* runCodeCommand({
     ...options,
     args: ["code", "ls", "--agent", "--repo", options.cwd],
     onEvent: Effect.fn("CodeRabbit.listTasks.onEvent")(function* (event: CodeEvent) {
       const error = commandFailure(event);
       if (error) return yield* error;
-      if (isKnownCodeEvent(event)) {
-        if (event.type === "task") tasks = [...tasks, event.task];
-        if (event.type === "complete" && event.status === "tasks_listed") tasks = event.tasks;
+      const known = isKnownCodeEvent(event);
+      if (event.type === "task" && !known) {
+        return yield* new CommandError({ operation: "decode listed task" });
+      }
+      if ("status" in event && event.status === "tasks_listed") {
+        if (!known || event.type !== "complete") {
+          return yield* new CommandError({ operation: "decode task list receipt" });
+        }
+      }
+      if (known && event.type === "complete" && event.status === "tasks_listed") {
+        tasks = event.tasks;
       }
     }),
   });
-  if (code !== 0) return yield* new CommandError({ operation: "list tasks" });
+  if (code !== 0 || tasks === undefined)
+    return yield* new CommandError({ operation: "list tasks" });
   // The CLI defaults to the caller's own tasks, newest first, with a 20-task limit.
   return tasks;
 });

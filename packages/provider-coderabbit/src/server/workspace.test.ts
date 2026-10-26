@@ -165,6 +165,7 @@ describe("CodeRabbit source workspace", () => {
       const spawner = ChildProcessSpawner.make((command) =>
         Effect.sync(() => {
           assert(command._tag === "StandardCommand");
+          expect(command.options.forceKillAfter).toBe("1 second");
           const step = steps[commands.length];
           assert(step, "Unexpected command after push");
           const invocation = { command: command.command, args: command.args };

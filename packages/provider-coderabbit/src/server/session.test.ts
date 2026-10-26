@@ -1,13 +1,18 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
+import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -202,39 +207,78 @@ it.live("fails a request whose response does not match the known shape", () =>
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const response = (id: string) => ({
+  type: "response",
+  phase: "code",
+  id,
+  ok: true,
+  status: "task_shown",
+});
+const makeSessionFixture = Effect.fn("test.makeSessionFixture")(function* (
+  options: {
+    startWriting?: Deferred.Deferred<void>;
+    writePermits?: Queue.Queue<void>;
+  } = {},
+) {
+  const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+  const writes = yield* Queue.unbounded<string>();
+  const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+  const eof = yield* Deferred.make<void>();
+  const stdin = Sink.forEach((chunk: Uint8Array) =>
+    Effect.gen(function* () {
+      yield* Queue.offer(writes, new TextDecoder().decode(chunk));
+      if (options.writePermits) yield* Queue.take(options.writePermits);
+    }),
+  ).pipe(
+    Sink.mapEffect(() =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(eof, undefined);
+        yield* Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0));
+        yield* Queue.end(stdout);
+      }),
+    ),
+  );
+  const spawner = ChildProcessSpawner.make(() =>
+    Effect.succeed(
+      ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(123),
+        exitCode: Deferred.await(exited),
+        isRunning: Effect.succeed(true),
+        kill: () => Effect.void,
+        unref: Effect.succeed(Effect.void),
+        stdin: Sink.unwrap(
+          (options.startWriting ? Deferred.await(options.startWriting) : Effect.void).pipe(
+            Effect.as(stdin),
+          ),
+        ),
+        stdout: Stream.fromQueue(stdout),
+        stderr: Stream.empty,
+        all: Stream.empty,
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+      }),
+    ),
+  );
+  const session = yield* openInteractiveSession({
+    binaryPath: "/fake/cr",
+    taskId: "task-1",
+    cwd: "/fake",
+    env: {},
+    spawner,
+  });
+  const emit = (...frames: ReadonlyArray<unknown>) =>
+    Queue.offer(
+      stdout,
+      new TextEncoder().encode(frames.map((frame) => encodeJson(frame)).join("\n") + "\n"),
+    );
+  return { session, writes, eof, emit };
+});
+
 it.effect("times out at 60 seconds, cleans pending requests and ignores late replies", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
-      const writes = yield* Queue.unbounded<string>();
-      const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
-      const eof = yield* Deferred.make<void>();
-      const spawner = ChildProcessSpawner.make(() =>
-        Effect.succeed(
-          ChildProcessSpawner.makeHandle({
-            pid: ChildProcessSpawner.ProcessId(123),
-            exitCode: Deferred.await(exited),
-            isRunning: Effect.succeed(true),
-            kill: () => Effect.void,
-            unref: Effect.succeed(Effect.void),
-            stdin: Sink.forEach((chunk: Uint8Array) =>
-              Queue.offer(writes, new TextDecoder().decode(chunk)),
-            ).pipe(Sink.mapEffect(() => Deferred.succeed(eof, undefined).pipe(Effect.asVoid))),
-            stdout: Stream.fromQueue(stdout),
-            stderr: Stream.empty,
-            all: Stream.empty,
-            getInputFd: () => Sink.drain,
-            getOutputFd: () => Stream.empty,
-          }),
-        ),
-      );
-      const session = yield* openInteractiveSession({
-        binaryPath: "/fake/cr",
-        taskId: "task-1",
-        cwd: "/fake",
-        env: {},
-        spawner,
-      });
+      const { session, writes, emit } = yield* makeSessionFixture();
       const first = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
       assert.equal(yield* Queue.take(writes), '{"id":"r1","command":"show"}\n');
       yield* TestClock.adjust("60 seconds");
@@ -242,18 +286,187 @@ it.effect("times out at 60 seconds, cleans pending requests and ignores late rep
       assert.equal(error.operation, "request timeout");
       const second = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
       assert.equal(yield* Queue.take(writes), '{"id":"r2","command":"show"}\n');
-      yield* Queue.offer(
-        stdout,
-        new TextEncoder().encode(
-          '{"type":"response","phase":"code","id":"r1","ok":true,"status":"late"}\n{"type":"response","phase":"code","id":"r2","ok":true,"status":"task_shown"}\n',
-        ),
-      );
+      yield* emit(response("r1"), response("r2"));
       assert.equal((yield* Fiber.join(second)).id, "r2");
-      const closing = yield* session.close.pipe(Effect.forkScoped);
-      yield* Deferred.await(eof);
-      yield* Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0));
-      yield* Queue.end(stdout);
-      yield* Fiber.join(closing);
+      yield* session.close;
     }),
   ),
+);
+
+it.effect("discards expired and cancelled requests behind an already-pulled writer item", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startWriting = yield* Deferred.make<void>();
+      const writePermits = yield* Queue.unbounded<void>();
+      const { session, writes, emit } = yield* makeSessionFixture({ startWriting, writePermits });
+      const first = yield* session
+        .request({ command: "show" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const expired = yield* session
+        .request({ command: "cancel" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const cancelled = yield* session
+        .request({ command: "close" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(startWriting, undefined);
+      assert.equal(yield* Queue.take(writes), '{"id":"r1","command":"show"}\n');
+      yield* emit(response("r1"));
+      yield* Fiber.join(first);
+      yield* Fiber.interrupt(cancelled);
+      yield* TestClock.adjust("60 seconds");
+      assert.equal((yield* Fiber.join(expired).pipe(Effect.flip)).operation, "request timeout");
+      const live = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+      yield* Queue.offer(writePermits, undefined);
+      assert.equal(yield* Queue.take(writes), '{"id":"r4","command":"show"}\n');
+      yield* emit(response("r4"));
+      yield* Fiber.join(live);
+      yield* Queue.offer(writePermits, undefined);
+      yield* session.close;
+      assert.equal(yield* Queue.size(writes), 0);
+    }),
+  ),
+);
+
+it.effect("close discards unsent requests after a writer has pulled its first item", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const startWriting = yield* Deferred.make<void>();
+      const writePermits = yield* Queue.unbounded<void>();
+      const { session, writes, eof } = yield* makeSessionFixture({ startWriting, writePermits });
+      const first = yield* session
+        .request({ command: "show" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      const unsent = yield* session
+        .request({ command: "cancel" })
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(startWriting, undefined);
+      assert.equal(yield* Queue.take(writes), '{"id":"r1","command":"show"}\n');
+      const closing = yield* session.close.pipe(Effect.forkScoped);
+      assert.equal((yield* Fiber.join(first).pipe(Effect.flip)).operation, "session closed");
+      assert.equal((yield* Fiber.join(unsent).pipe(Effect.flip)).operation, "session closed");
+      yield* Queue.offer(writePermits, undefined);
+      yield* Deferred.await(eof);
+      yield* Fiber.join(closing);
+      assert.equal(yield* Queue.size(writes), 0);
+    }),
+  ),
+);
+
+it.effect(
+  "correlates responses with a full event backlog and releases capacity as frames drain",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { session, writes, emit } = yield* makeSessionFixture();
+        const first = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+        yield* Queue.take(writes);
+        yield* emit(...Array.from({ length: 1024 }, () => ready), response("r1"));
+        assert.equal((yield* Fiber.join(first)).id, "r1");
+        const frames = yield* Stream.runCollect(session.frames.pipe(Stream.take(1024)));
+        assert.equal(frames.length, 1024);
+        const second = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+        yield* Queue.take(writes);
+        yield* emit(ready, response("r2"));
+        assert.equal((yield* Fiber.join(second)).id, "r2");
+        yield* session.close;
+        assert.deepEqual(yield* Stream.runCollect(session.frames), [ready]);
+      }),
+    ),
+);
+
+it.effect("fails and detaches when the event count exceeds its bound", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { session, writes, emit, eof } = yield* makeSessionFixture();
+      const request = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+      yield* Queue.take(writes);
+      yield* emit(...Array.from({ length: 1025 }, () => ready));
+      assert.equal(
+        (yield* Fiber.join(request).pipe(Effect.flip)).operation,
+        "read backlog overflow",
+      );
+      assert.equal(
+        (yield* Stream.runCollect(session.frames).pipe(Effect.flip)).operation,
+        "read backlog overflow",
+      );
+      yield* Deferred.await(eof);
+      assert.equal(
+        (yield* session.request({ command: "show" }).pipe(Effect.flip)).operation,
+        "read backlog overflow",
+      );
+      yield* session.close;
+    }),
+  ),
+);
+
+it.effect("bounds retained event bytes even when each frame is below the frame limit", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { session, writes, emit, eof } = yield* makeSessionFixture();
+      const request = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+      yield* Queue.take(writes);
+      const frame = {
+        type: "trace",
+        phase: "code",
+        taskId: "task-1",
+        seq: 1,
+        createdAt: "2026-10-16",
+        kind: "agent_message",
+        text: "x".repeat(600_000),
+      };
+      yield* emit(frame, frame, frame, frame);
+      assert.equal(
+        (yield* Fiber.join(request).pipe(Effect.flip)).operation,
+        "read backlog overflow",
+      );
+      assert.equal(
+        (yield* Stream.runCollect(session.frames).pipe(Effect.flip)).operation,
+        "read backlog overflow",
+      );
+      yield* Deferred.await(eof);
+      yield* session.close;
+    }),
+  ),
+);
+
+it.live("scope cleanup force-kills an interactive child that resists SIGTERM", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-resistant-" });
+      const marker = `${cwd}/sigterm.txt`;
+      const binaryPath = writeFakeCli({
+        directory: cwd,
+        name: "fake-cr",
+        source: `
+    import { writeFileSync } from 'node:fs';
+    process.on('SIGTERM', () => writeFileSync(${JSON.stringify(marker)}, 'SIGTERM'));
+    process.stdin.resume();
+    setInterval(() => {}, 1_000);
+    console.log(${JSON.stringify(JSON.stringify(ready))});
+  `,
+      });
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const processScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(processScope, Exit.void));
+      const session = yield* openInteractiveSession({
+        binaryPath,
+        taskId: "task-1",
+        cwd,
+        env: process.env,
+        spawner: ChildProcessSpawner.make((command) =>
+          spawner.spawn(command).pipe(Effect.provideService(Scope.Scope, processScope)),
+        ),
+      });
+      yield* Stream.runHead(session.frames);
+      yield* Scope.close(processScope, Exit.void);
+      const error = yield* session.exitCode.pipe(Effect.flip);
+      assert.equal(error.operation, "exit");
+      if ((yield* HostProcess.Platform) !== "win32") {
+        assert.equal(yield* fs.readFileString(marker), "SIGTERM");
+        assert.instanceOf(error.cause, PlatformError.PlatformError);
+        assert.include(String(error.cause.reason.cause), "SIGKILL");
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );

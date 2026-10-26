@@ -36,6 +36,10 @@ select a project, list your tasks, and import one. Import creates a T3 thread fo
 it does not copy cloud changes into the local checkout. The first follow-up shows the latest cloud
 reply. Earlier history stays in the web app.
 
+If a new task's submission cannot be confirmed, T3 Code blocks another submission in that thread
+to avoid creating a duplicate. Check your CodeRabbit task list and import the task to continue.
+If no task was created, start a new T3 thread.
+
 CodeRabbit supports **Full access** and the **Default** interaction mode only. T3 Code cannot
 enforce a local sandbox or forward interactive tool approvals into its cloud environment.
 Text helpers such as thread titles and commit messages require another enabled provider.

@@ -5,7 +5,6 @@ import {
   DEFAULT_TIMEOUT_MS,
   isCommandMissingCause,
   parseGenericCliVersion,
-  spawnAndCollect,
   type ProviderProbeResult,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -17,6 +16,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import type { CodeRabbitSettings } from "../settings.ts";
+import { collectCodeRabbitCommand } from "./protocol.ts";
 import type { TaskCommandOptions } from "./tasks.ts";
 
 const PRESENTATION = {
@@ -55,13 +55,14 @@ export const probeCodeRabbitOrganization = Effect.fn("CodeRabbit.probeOrganizati
     const spawn = yield* resolveSpawnCommand(options.binaryPath, ["auth", "status", "--agent"], {
       env: options.env,
     });
-    const result = yield* spawnAndCollect(
+    const result = yield* collectCodeRabbitCommand(
       options.binaryPath,
       ChildProcess.make(spawn.command, spawn.args, {
         cwd: options.cwd,
         env: options.env,
         extendEnv: false,
         shell: spawn.shell,
+        forceKillAfter: "1 second",
         stdin: "ignore",
       }),
     );
@@ -123,11 +124,12 @@ export const checkCodeRabbitProviderStatus = Effect.fn("checkCodeRabbitProviderS
       args,
       environment ? { env: environment } : undefined,
     );
-    return yield* spawnAndCollect(
+    return yield* collectCodeRabbitCommand(
       settings.binaryPath,
       ChildProcess.make(spawn.command, spawn.args, {
         env: environment,
         shell: spawn.shell,
+        forceKillAfter: "1 second",
         stdin: "ignore",
         ...(cwd ? { cwd } : {}),
       }),

@@ -19,6 +19,9 @@ import {
 } from "./protocol.ts";
 
 const isCommandError = Schema.is(CommandError);
+const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const MAX_BUFFERED_EVENTS = 1024;
+const MAX_BUFFERED_EVENT_BYTES = 4 * 1024 * 1024;
 
 export interface InteractiveSessionOptions {
   readonly binaryPath: string;
@@ -39,28 +42,44 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
   options: InteractiveSessionOptions,
 ) {
   const scope = yield* Effect.scope;
-  const incoming = yield* Queue.unbounded<CodeEvent, CommandError | Cause.Done>();
-  const outgoing = yield* Queue.unbounded<Uint8Array, Cause.Done>();
-  const pending = new Map<string, Deferred.Deferred<CodeResponse, CommandError>>();
+  const incoming = yield* Queue.dropping<
+    { frame: CodeEvent; retainedBytes: number },
+    CommandError | Cause.Done
+  >(MAX_BUFFERED_EVENTS);
+  const outgoing = yield* Queue.bounded<string, Cause.Done>(256);
+  const endOutgoing = Queue.end(outgoing).pipe(
+    Effect.andThen(Queue.shutdown(outgoing)),
+    Effect.asVoid,
+  );
+  const pending = new Map<
+    string,
+    { response: Deferred.Deferred<CodeResponse, CommandError>; bytes: Uint8Array }
+  >();
+  let bufferedEventBytes = 0;
   const exited = yield* Deferred.make<number, CommandError>();
   let nextId = 0;
   let closed = false;
   let transportError: CommandError | undefined;
   const failPending = Effect.fn("CodeRabbit.failPending")(function* (error: CommandError) {
     transportError ??= error;
-    for (const [id, deferred] of pending) {
-      pending.delete(id);
-      yield* Deferred.fail(deferred, error);
+    const requests = Array.from(pending.values());
+    pending.clear();
+    for (const request of requests) {
+      yield* Deferred.fail(request.response, error);
     }
   });
   const failTransport = Effect.fn("CodeRabbit.failTransport")(function* (error: CommandError) {
     yield* failPending(error);
-    yield* Queue.end(outgoing);
+    yield* endOutgoing;
     yield* Queue.fail(incoming, error);
+    // Effect 4 preserves a closing queue's failure when shutdown discards its buffered frames.
+    yield* Queue.shutdown(incoming);
+    bufferedEventBytes = 0;
   });
   yield* Effect.addFinalizer(() =>
     failPending(new CommandError({ operation: "session closed" })).pipe(
-      Effect.andThen(Queue.end(outgoing)),
+      Effect.andThen(endOutgoing),
+      Effect.andThen(Queue.shutdown(incoming)),
       Effect.asVoid,
     ),
   );
@@ -76,6 +95,7 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
         env: options.env,
         extendEnv: false,
         shell: spawn.shell,
+        forceKillAfter: "1 second",
       }),
     )
     .pipe(Effect.mapError((cause) => new CommandError({ operation: "spawn", cause })));
@@ -91,13 +111,13 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
     Effect.gen(function* () {
       // Correlate on id alone so response-shape drift fails the request now, not at the timeout.
       if (frame.type === "response" && typeof frame.id === "string") {
-        const deferred = pending.get(frame.id);
-        if (deferred === undefined) return;
+        const request = pending.get(frame.id);
+        if (request === undefined) return;
         pending.delete(frame.id);
         yield* isCodeResponse(frame)
-          ? Deferred.succeed(deferred, frame)
+          ? Deferred.succeed(request.response, frame)
           : Deferred.fail(
-              deferred,
+              request.response,
               new CommandError({
                 operation: "decode response",
                 detail: "Unrecognized CodeRabbit response.",
@@ -105,14 +125,24 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
             );
         return;
       }
-      yield* Queue.offer(incoming, frame);
+      // UTF-16 serialized size bounds retained text; the count limit also bounds object overhead.
+      const retainedBytes = encodeEventJson(frame).length * 2;
+      if (
+        bufferedEventBytes + retainedBytes > MAX_BUFFERED_EVENT_BYTES ||
+        !(yield* Queue.offer(incoming, { frame, retainedBytes }))
+      )
+        return yield* new CommandError({
+          operation: "read backlog overflow",
+          detail: "CodeRabbit event backlog exceeded its count or retained size limit.",
+        });
+      bufferedEventBytes += retainedBytes;
     }),
   ).pipe(
     Effect.matchEffect({
       onSuccess: () =>
         failPending(
           new CommandError({ operation: "read", detail: "CodeRabbit session closed stdout." }),
-        ).pipe(Effect.andThen(Queue.end(incoming))),
+        ).pipe(Effect.andThen(endOutgoing), Effect.andThen(Queue.end(incoming))),
       onFailure: (cause) =>
         failTransport(
           isCommandError(cause) ? cause : new CommandError({ operation: "read", cause }),
@@ -124,25 +154,33 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
     Effect.catch((cause) => failTransport(new CommandError({ operation: "stderr", cause }))),
     Effect.forkIn(scope),
   );
-  yield* Stream.fromQueue(outgoing).pipe(
+  // Pull one id at a time: a dequeued batch must not retain bytes past cancellation or teardown.
+  yield* Stream.fromEffectRepeat(Queue.take(outgoing)).pipe(
+    Stream.map((id) =>
+      transportError === undefined && !closed ? pending.get(id)?.bytes : undefined,
+    ),
+    Stream.filter((bytes): bytes is Uint8Array => bytes !== undefined),
     Stream.run(child.stdin),
     Effect.catch((cause) => failTransport(new CommandError({ operation: "write", cause }))),
     Effect.forkIn(scope),
   );
 
   const request = Effect.fn("CodeRabbit.request")(function* (command: CodeRequest) {
+    const id = `r${++nextId}`;
+    const encoded = yield* encodeCodeRequest(command, id);
+    const deferred = yield* Deferred.make<CodeResponse, CommandError>();
     if (transportError !== undefined) return yield* transportError;
     if (closed)
       return yield* new CommandError({
         operation: "request",
         detail: "CodeRabbit session is closed.",
       });
-    const id = `r${++nextId}`;
-    const encoded = yield* encodeCodeRequest(command, id);
-    const deferred = yield* Deferred.make<CodeResponse, CommandError>();
-    pending.set(id, deferred);
+    pending.set(id, {
+      response: deferred,
+      bytes: new TextEncoder().encode(`${encoded}\n`),
+    });
     return yield* Effect.gen(function* () {
-      const accepted = yield* Queue.offer(outgoing, new TextEncoder().encode(`${encoded}\n`));
+      const accepted = yield* Queue.offer(outgoing, id);
       if (!accepted)
         return yield* new CommandError({
           operation: "write",
@@ -172,7 +210,7 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
   const close = Effect.gen(function* () {
     closed = true;
     yield* failPending(new CommandError({ operation: "session closed" }));
-    yield* Queue.end(outgoing);
+    yield* endOutgoing;
     yield* Deferred.await(exited);
   }).pipe(
     Effect.timeoutOrElse({
@@ -183,7 +221,12 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
   // Registered last so EOF reaches the CLI before its scoped fibers or process are stopped.
   yield* Effect.addFinalizer(() => close.pipe(Effect.ignore));
   return {
-    frames: Stream.fromQueue(incoming),
+    frames: Stream.fromEffectRepeat(Queue.take(incoming)).pipe(
+      Stream.map(({ frame, retainedBytes }) => {
+        bufferedEventBytes -= retainedBytes;
+        return frame;
+      }),
+    ),
     request,
     exitCode: Deferred.await(exited),
     close,

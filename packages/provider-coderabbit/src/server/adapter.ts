@@ -49,6 +49,9 @@ const decodeSettings = Schema.decodeSync(CodeRabbitSettings);
 const encodeAnswers = Schema.encodeEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.String)),
 );
+const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const MAX_BUFFERED_EVENTS = 1024;
+const MAX_BUFFERED_EVENT_BYTES = 4 * 1024 * 1024;
 const codeRabbitCapabilities = {
   runtimePolicy: { enforcement: "client-boundary" },
   sessions: {
@@ -149,7 +152,7 @@ interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurn: OrchestrationV2ProviderTurn;
   readonly messageReceipt: Deferred.Deferred<void>;
-  startFiber: Fiber.Fiber<void, IdAllocator.IdAllocatorV2AllocationError> | null;
+  startFiber: Fiber.Fiber<void, IdAllocator.IdAllocatorV2AllocationError | CommandError> | null;
   taskId: string | null;
   createdTask: boolean;
   taskURL: string | null;
@@ -157,6 +160,7 @@ interface ActiveTurn {
   acceptedSeq: number;
   awaitingMessageReceipt: boolean;
   submitted: boolean;
+  submissionUnconfirmed: boolean;
   stopRequested: boolean;
   admittedAt: number | null;
   runningObserved: boolean;
@@ -168,6 +172,7 @@ interface ActiveTurn {
   readonly text: string;
   readonly previousHead: OrchestrationV2ProviderThread["nativeConversationHeadRef"];
   buffered: CodeEvent[];
+  bufferedBytes: number;
   lastAssistantText: string | null;
   lastAssistantKey: string | null;
   lastAssistantCreatedAt: DateTime.Utc | null;
@@ -232,8 +237,13 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       let connectionReady = yield* Deferred.make<InteractiveSession, CommandError>();
       let admissionUncertain = false;
       let foreignMessages: CodeEvent[] = [];
-      let pendingWake: { events: CodeEvent[]; cursor: number; completed: Turn | undefined } | null =
-        null;
+      let foreignMessageBytes = 0;
+      let pendingWake: {
+        events: CodeEvent[];
+        bytes: number;
+        cursor: number;
+        completed: Turn | undefined;
+      } | null = null;
       let lastSettled: { queueItemId: string | null; endSeq: number; at: number } | null = null;
       let wakeProbeInFlight = false;
       let wakeProbeKey: string | null = null;
@@ -333,7 +343,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       ) {
         if (!thread?.appThreadId || closed || frames.length === 0) return;
         workVersion++;
-        const wake = { events: frames, cursor, completed };
+        const wake = {
+          events: frames,
+          bytes: frames.reduce((bytes, frame) => bytes + encodeEventJson(frame).length * 2, 0),
+          cursor,
+          completed,
+        };
         pendingWake = wake;
         yield* updateSession("running");
         yield* continuationRequests.offer({
@@ -367,7 +382,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       ) {
         if (turn.finished) return;
         turn.finished = true;
-        if (turn.taskId === null || (!turn.submitted && turn.awaitingMessageReceipt))
+        turn.buffered = [];
+        turn.bufferedBytes = 0;
+        if (
+          (turn.taskId === null && !turn.submissionUnconfirmed) ||
+          (!turn.submitted && turn.awaitingMessageReceipt)
+        )
           yield* updateThread({ nativeConversationHeadRef: turn.previousHead });
         const at = yield* DateTime.now;
         if (turn.pending) {
@@ -444,9 +464,39 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         if (foreignMessages.length) {
           const queued = foreignMessages;
           foreignMessages = [];
+          foreignMessageBytes = 0;
           yield* offerWake(queued, lastSettled?.endSeq ?? lastSeq);
         }
       }, Effect.uninterruptible);
+      // Receipts and continuation dispatch can lag behind a healthy stream consumer.
+      const bufferFrame = Effect.fnUntraced(function* (
+        frames: CodeEvent[],
+        bytes: number,
+        frame: CodeEvent,
+      ) {
+        const retainedBytes = bytes + encodeEventJson(frame).length * 2;
+        if (frames.length >= MAX_BUFFERED_EVENTS || retainedBytes > MAX_BUFFERED_EVENT_BYTES) {
+          const message =
+            "CodeRabbit event backlog exceeded its limit. Inspect the cloud task before continuing.";
+          pendingWake = null;
+          foreignMessages = [];
+          foreignMessageBytes = 0;
+          yield* Effect.logWarning("CodeRabbit adapter backlog overflow", {
+            taskId: task?.taskId ?? null,
+            sequence: lastSeq,
+          });
+          if (active) {
+            if (active.submitted && active.awaitingMessageReceipt) admissionUncertain = true;
+            yield* finish(active, "failed", message);
+          } else {
+            session = { ...session, lastError: message };
+            yield* updateSession("error");
+          }
+          return yield* new CommandError({ operation: "buffer events", detail: message });
+        }
+        frames.push(frame);
+        return retainedBytes;
+      });
       const ask = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         event: { readonly question: PendingQuestion; readonly answerTemplate?: unknown },
@@ -638,16 +688,40 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           do {
             turn.latestPending = false;
             yield* Effect.gen(function* () {
-              const result = yield* fetchLatestTurn({ ...taskOptions, taskId }).pipe(
+              const result = yield* Effect.suspend(() =>
+                turn.finished || closed
+                  ? Effect.succeed(null)
+                  : fetchLatestTurn({ ...taskOptions, taskId }).pipe(
+                      Effect.flatMap((result) =>
+                        matchesTurn(turn, result.turn)
+                          ? Effect.succeed(result)
+                          : Effect.fail(new CommandError({ operation: "fetch current turn" })),
+                      ),
+                    ),
+              ).pipe(
                 Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.retry({
+                  times: 2,
+                  schedule: Schedule.exponential("1 second"),
+                  while: () => !turn.finished && !closed,
+                }),
               );
+              if (result === null) return;
               yield* Effect.gen(function* () {
                 if (turn.finished) return;
                 task = result.task;
                 if (matchesTurn(turn, result.turn)) yield* settle(turn, result.turn, result.task);
               }).pipe(eventPermit.withPermits(1));
             }).pipe(
-              Effect.catch((cause) => Effect.logDebug("CodeRabbit latest turn unavailable", cause)),
+              Effect.catch(() =>
+                Effect.gen(function* () {
+                  turn.latestStatusKey = null;
+                  yield* Effect.logWarning("CodeRabbit latest turn unavailable", {
+                    taskId,
+                    providerTurnId: turn.providerTurn.id,
+                  });
+                }),
+              ),
             );
           } while (!turn.finished && turn.latestPending);
         }).pipe(
@@ -671,7 +745,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           return;
         }
         if (turn.awaitingMessageReceipt) {
-          turn.buffered.push(frame);
+          turn.bufferedBytes = yield* bufferFrame(turn.buffered, turn.bufferedBytes, frame);
           return;
         }
         if (frame.type === "trace") {
@@ -691,7 +765,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               ? frame.queueItemId !== turn.operationId
               : !continuation && frame.text !== turn.text)
           ) {
-            foreignMessages.push(frame);
+            foreignMessageBytes = yield* bufferFrame(foreignMessages, foreignMessageBytes, frame);
             return;
           }
           lastSeq = Math.max(lastSeq, frame.seq);
@@ -875,7 +949,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           return;
         }
         if (pendingWake) {
-          pendingWake.events.push(frame);
+          pendingWake.bytes = yield* bufferFrame(pendingWake.events, pendingWake.bytes, frame);
           return;
         }
         if (!thread?.appThreadId) return;
@@ -1113,6 +1187,14 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             );
           let recovered: { turn: Turn; task: TaskDetail } | null = null;
           const uncertainTaskId = thread.nativeThreadRef?.nativeId;
+          if (
+            !uncertainTaskId &&
+            thread.firstRunOrdinal !== null &&
+            thread.nativeConversationHeadRef?.nativeId?.startsWith("initial:")
+          )
+            return yield* protocolError(
+              "CodeRabbit task submission is unconfirmed. Check your task list at app.coderabbit.ai and import the existing task before continuing. If no task was created, start a new T3 thread.",
+            );
           if (!uncertainTaskId) admissionUncertain = false;
           if (admissionUncertain && uncertainTaskId) {
             const child = yield* ensureInteractive().pipe(Effect.option);
@@ -1195,6 +1277,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                 : lastSeq + 1,
             awaitingMessageReceipt: !continuation && !reattach,
             submitted: false,
+            submissionUnconfirmed: false,
             stopRequested: false,
             admittedAt: continuation || reattach ? DateTime.toEpochMillis(at) : null,
             runningObserved: continuation,
@@ -1206,6 +1289,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             text,
             previousHead: thread.nativeConversationHeadRef,
             buffered: [],
+            bufferedBytes: 0,
             lastAssistantText: null,
             lastAssistantKey: null,
             lastAssistantCreatedAt: null,
@@ -1377,6 +1461,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               yield* Deferred.succeed(turn.messageReceipt, undefined);
               const buffered = turn.buffered;
               turn.buffered = [];
+              turn.bufferedBytes = 0;
               for (const frame of buffered) {
                 if (turn.finished) yield* route(frame);
                 else yield* handle(turn, frame, true);
@@ -1386,6 +1471,16 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             Effect.catch((cause) =>
               Effect.gen(function* () {
                 if (turn.finished) return;
+                if (
+                  turn.taskId === null &&
+                  turn.submitted &&
+                  !(
+                    cause._tag === "CodeRabbitCommandError" &&
+                    (["resolve command", "spawn"].includes(cause.operation) ||
+                      (cause.operation === "task command" && cause.status === "auth_required"))
+                  )
+                )
+                  turn.submissionUnconfirmed = true;
                 if (turn.taskId !== null && turn.submitted && turn.awaitingMessageReceipt) {
                   const proof = turn.buffered.find(
                     (frame) =>
@@ -1413,6 +1508,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                       yield* Deferred.succeed(turn.messageReceipt, undefined);
                       const frames = turn.buffered;
                       turn.buffered = [];
+                      turn.bufferedBytes = 0;
                       for (const frame of frames) {
                         if (turn.finished) yield* route(frame);
                         else yield* handle(turn, frame, true);

@@ -2425,6 +2425,114 @@ it.live("latest failure is deduplicated and leaves the turn and follower running
   ),
 );
 
+it.live.each(["failure", "stale", "finished"])(
+  "recovers a terminal lookup without another status or trace (%s)",
+  (lookup) =>
+    live(
+      Effect.gen(function* () {
+        const clock = yield* TestClock.make();
+        const backoffs = yield* Queue.unbounded<number>();
+        const observedClock: Clock.Clock = {
+          ...clock,
+          sleep: (duration) =>
+            Effect.gen(function* () {
+              const milliseconds = Duration.toMillis(duration);
+              if (milliseconds === 1_000 || milliseconds === 2_000)
+                yield* Queue.offer(backoffs, milliseconds);
+              yield* clock.sleep(duration);
+            }),
+        };
+        yield* Effect.gen(function* () {
+          const f = yield* fixture({
+            latest:
+              "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else if(!existsSync(signal('lookup-failed'))){mark('lookup-failed');" +
+              (lookup === "stale"
+                ? "emit({...result,turn:{...result.turn,queueItemId:'previous-operation'}});"
+                : "process.exit(1);") +
+              "}else{emit({...result,turn:{...result.turn,queueItemId:'op-1',finalReply:'Recovered after lookup failure'}});}",
+            message:
+              "ack(req);trace('agent_message',{text:'Admitted'});await wait('terminal-status');emit({phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-01T00:00:00Z'}});await wait('finish');end();",
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          yield* f.assistant("Admitted");
+          yield* f.mark("terminal-status");
+          expect(yield* Queue.take(backoffs)).toBe(1_000);
+          if (lookup === "finished") {
+            yield* f.mark("finish");
+            expect((yield* f.terminal).status).toBe("completed");
+            yield* clock.adjust("1 second");
+            expect(
+              (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+            ).toHaveLength(2);
+            return;
+          }
+          yield* clock.adjust("1 second");
+          expect((yield* f.terminal).status).toBe("completed");
+          expect(f.allEvents).toContainEqual(
+            expect.objectContaining({
+              type: "message.updated",
+              message: expect.objectContaining({
+                text: expect.stringMatching(/^Recovered after lookup failure\n\n---/u),
+              }),
+            }),
+          );
+          expect(
+            (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+          ).toHaveLength(3);
+        }).pipe(Effect.provideService(Clock.Clock, observedClock));
+      }),
+    ),
+);
+
+it.live("retries the same terminal status after exhausting a bounded lookup retry", () =>
+  live(
+    Effect.gen(function* () {
+      const clock = yield* TestClock.make();
+      const backoffs = yield* Queue.unbounded<number>();
+      const failed = yield* Deferred.make<void>();
+      const observedClock: Clock.Clock = {
+        ...clock,
+        sleep: (duration) =>
+          Effect.gen(function* () {
+            const milliseconds = Duration.toMillis(duration);
+            if (milliseconds === 1_000 || milliseconds === 2_000)
+              yield* Queue.offer(backoffs, milliseconds);
+            yield* clock.sleep(duration);
+          }),
+      };
+      const logger = Logger.make(({ message }) => {
+        if (JSON.stringify(message).includes("CodeRabbit latest turn unavailable"))
+          Deferred.doneUnsafe(failed, Effect.void);
+      });
+      yield* Effect.gen(function* () {
+        const f = yield* fixture({
+          latest:
+            "if(!existsSync(signal('previewed'))){mark('previewed');emit(result);}else{const n=existsSync(signal('lookups'))?Number(readFileSync(signal('lookups'),'utf8')):0;writeFileSync(signal('lookups'),String(n+1));if(n<3)process.exit(1);emit({...result,turn:{...result.turn,queueItemId:'op-1'}});}",
+          message:
+            "ack(req);trace('agent_message',{text:'Admitted'});await wait('terminal-status');const status={phase:'code',type:'status',status:'task_updated',task:{...result.task,updatedAt:'2099-01-01T00:00:00Z'}};emit(status);await wait('retry-status');emit(status);",
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        yield* f.assistant("Admitted");
+        yield* f.mark("terminal-status");
+        expect(yield* Queue.take(backoffs)).toBe(1_000);
+        yield* clock.adjust("1 second");
+        expect(yield* Queue.take(backoffs)).toBe(2_000);
+        yield* clock.adjust("2 seconds");
+        yield* Deferred.await(failed);
+        expect(f.runtime.providerSession.status).toBe("running");
+        yield* f.mark("retry-status");
+        expect((yield* f.terminal).status).toBe("completed");
+        expect(
+          (yield* f.calls).filter((call) => call.args && !call.args.includes("--interactive")),
+        ).toHaveLength(5);
+      }).pipe(
+        Effect.provideService(Clock.Clock, observedClock),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
+    }),
+  ),
+);
+
 it.live("correlates queue ids when the client operation id is distinct", () =>
   live(
     Effect.gen(function* () {
@@ -2815,8 +2923,8 @@ it.live.each(["probe", "status"])(
     ),
 );
 
-it.live.each(["auth", "exit", "timeout"])(
-  "settles a null-queue initial turn after task creation fails with %s",
+it.live.each(["auth", "authenticate", "generic", "exit", "timeout"])(
+  "guards retries after initial task creation fails with %s",
   (failure) =>
     live(
       Effect.gen(function* () {
@@ -2829,9 +2937,13 @@ it.live.each(["auth", "exit", "timeout"])(
               "if(!existsSync(signal('create-failed'))){mark('create-failed');" +
               (failure === "auth"
                 ? "emit({phase:'code',type:'error',status:'auth_required',message:'Authentication required'});process.exit(1);"
-                : failure === "exit"
-                  ? "process.exit(1);"
-                  : "await wait('never-created');") +
+                : failure === "authenticate"
+                  ? "emit({phase:'code',type:'action_required',action:'authenticate',message:'Authentication required',command:'cr auth login'});process.exit(1);"
+                  : failure === "generic"
+                    ? "emit({phase:'code',type:'error',status:'server_error',message:'Submission status unknown'});process.exit(1);"
+                    : failure === "exit"
+                      ? "process.exit(1);"
+                      : "await wait('never-created');") +
               "}",
           });
           yield* f.runtime.startTurn(f.turnInput);
@@ -2840,18 +2952,46 @@ it.live.each(["auth", "exit", "timeout"])(
           const failed = yield* f.terminal;
           expect(failed.status).toBe("failed");
           expect(failed.failure?.message).toContain(
-            failure === "auth" ? "cr auth login" : "app.coderabbit.ai before retrying",
+            failure === "auth" || failure === "authenticate"
+              ? "cr auth login"
+              : "app.coderabbit.ai before retrying",
           );
           expect(failed.failure?.message).not.toContain("running: null");
           const restored = f.allEvents.findLast(
             (event) => event.type === "provider_thread.updated",
           );
-          expect(restored).toMatchObject({
-            providerThread: { nativeConversationHeadRef: null, nativeThreadRef: null },
-          });
-          yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
-          expect((yield* f.terminal).status).toBe("completed");
-          expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(2);
+          if (failure === "auth" || failure === "authenticate") {
+            expect(restored).toMatchObject({
+              providerThread: { nativeConversationHeadRef: null, nativeThreadRef: null },
+            });
+            yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
+            expect((yield* f.terminal).status).toBe("completed");
+            expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(2);
+          } else {
+            expect(restored).toMatchObject({
+              providerThread: {
+                nativeConversationHeadRef: { nativeId: expect.stringMatching(/^initial:/u) },
+                nativeThreadRef: null,
+              },
+            });
+            const error = yield* f.runtime.startTurn(nextTurn(f.turnInput, 2)).pipe(Effect.flip);
+            expect(error.message).toContain("task submission is unconfirmed");
+            assert(restored?.type === "provider_thread.updated");
+            const thread = yield* f.runtime.ensureThread({
+              threadId: THREAD,
+              modelSelection,
+              runtimePolicy: f.runtimePolicy,
+              existingProviderThread: restored.providerThread,
+            });
+            const resumedError = yield* f.runtime
+              .startTurn({
+                ...nextTurn(f.turnInput, 3),
+                providerThread: thread,
+              })
+              .pipe(Effect.flip);
+            expect(resumedError.message).toContain("task submission is unconfirmed");
+            expect((yield* f.calls).filter((call) => call.args?.[1] === "new")).toHaveLength(1);
+          }
         }).pipe(Effect.provideService(Clock.Clock, clock));
       }),
     ),
@@ -3025,6 +3165,36 @@ it.live("clears a restored unconfirmed guard when there is no native task id", (
   ),
 );
 
+it.live("blocks an initial submission restored without a task receipt", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({ initialTask: null });
+      const thread = yield* f.runtime.ensureThread({
+        threadId: THREAD,
+        modelSelection,
+        runtimePolicy: f.runtimePolicy,
+        existingProviderThread: {
+          ...f.thread,
+          firstRunOrdinal: 1,
+          nativeConversationHeadRef: {
+            driver: f.runtime.driver,
+            nativeId: "initial:before-restart",
+            strength: "strong",
+          },
+        },
+      });
+      const error = yield* f.runtime
+        .startTurn({
+          ...f.turnInput,
+          providerThread: thread,
+        })
+        .pipe(Effect.flip);
+      expect(error.message).toContain("task submission is unconfirmed");
+      expect(yield* f.calls).toEqual([]);
+    }),
+  ),
+);
+
 it.live("matches an initial prompt queue id despite a saved initial head", () =>
   live(
     Effect.gen(function* () {
@@ -3076,4 +3246,77 @@ it.live("does not re-wake on messages buffered behind a probe-carried completion
       );
     }),
   ),
+);
+
+it.live.each(["receipt", "foreign", "wake"])(
+  "bounds adapter-retained frames while the interactive stream drains (%s)",
+  (buffer) =>
+    live(
+      Effect.gen(function* () {
+        const barriers = yield* Queue.unbounded<string>();
+        const logger = Logger.make(({ message }) => {
+          const text = JSON.stringify(message);
+          if (
+            text.includes("Ignoring unknown CodeRabbit frame") &&
+            text.includes("buffered-frame-")
+          )
+            Queue.offerUnsafe(barriers, text);
+        });
+        yield* Effect.gen(function* () {
+          const frames = `
+            for(let i=1;i<=4;i++){
+              ${
+                buffer === "foreign"
+                  ? "trace('user_message',{text:'x'.repeat(600_000),queueItemId:'foreign-'+i,source:'web'});"
+                  : "trace('plan',{markdown:'x'.repeat(600_000)});"
+              }
+              emit({type:'buffered-frame-'+i});
+              await wait('next-'+i);
+            }
+          `;
+          const f = yield* fixture({
+            message:
+              buffer === "receipt"
+                ? frames
+                : buffer === "foreign"
+                  ? "ack(req);trace('agent_message',{text:'Admitted'});await wait('buffer-frames');" +
+                    frames
+                  : "ack(req);end();await wait('buffer-frames');trace('user_message',{text:'From web',queueItemId:'web-operation',source:'web'});" +
+                    frames,
+          });
+          yield* f.runtime.startTurn(f.turnInput);
+          let wake: ProviderContinuationRequest | undefined;
+          if (buffer === "wake") {
+            expect((yield* f.terminal).status).toBe("completed");
+            yield* f.mark("buffer-frames");
+            wake = yield* Queue.take(f.wakes);
+          } else if (buffer === "foreign") {
+            yield* f.assistant("Admitted");
+            yield* f.mark("buffer-frames");
+          }
+          for (const index of [1, 2, 3]) {
+            expect(yield* Queue.take(barriers)).toContain(`buffered-frame-${index}`);
+            yield* f.mark(`next-${index}`);
+          }
+          if (buffer === "wake") {
+            yield* f.next(
+              "provider_session.updated",
+              (event) => event.providerSession.status === "error",
+            );
+            assert(f.runtime.hasPendingBackgroundWork);
+            expect(yield* f.runtime.hasPendingBackgroundWork).toBe(false);
+            assert(wake);
+            assert(wake.dispatchIfCurrent);
+            expect(yield* wake.dispatchIfCurrent(Effect.void)).toEqual(Option.none());
+          } else {
+            const terminal = yield* f.terminal;
+            expect(terminal.status).toBe("failed");
+            expect(terminal.failure?.message).toContain("event backlog exceeded");
+          }
+        }).pipe(
+          Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        );
+      }),
+    ),
 );

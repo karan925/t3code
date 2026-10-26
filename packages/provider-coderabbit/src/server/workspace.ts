@@ -1,4 +1,3 @@
-import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { redactProviderFailureText } from "@t3tools/provider-core/server/failure";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 import * as Schedule from "effect/Schedule";
@@ -8,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import type { CodeRabbitSettings } from "../settings.ts";
+import { collectCodeRabbitCommand } from "./protocol.ts";
 import { probeCodeRabbitOrganization } from "./status.ts";
 
 export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>()(
@@ -79,13 +79,14 @@ const workspaceGit = Effect.fn("CodeRabbit.workspaceGit")(function* (
   timeout = 30_000,
 ) {
   const spawn = yield* resolveSpawnCommand("git", args, { env });
-  return yield* spawnAndCollect(
+  return yield* collectCodeRabbitCommand(
     "git",
     ChildProcess.make(spawn.command, spawn.args, {
       cwd,
       env: { ...env, GIT_TERMINAL_PROMPT: "0" },
       extendEnv: false,
       shell: spawn.shell,
+      forceKillAfter: "1 second",
       stdin: "ignore",
     }),
   ).pipe(Effect.timeout(timeout));

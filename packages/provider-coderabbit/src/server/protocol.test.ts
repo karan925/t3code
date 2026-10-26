@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import * as Effect from "effect/Effect";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
@@ -10,10 +11,12 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Sink from "effect/Sink";
 import * as TestClock from "effect/testing/TestClock";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import {
   CommandError,
+  collectCodeRabbitCommand,
   consumeCodeEvents,
   encodeCodeRequest,
   isKnownCodeEvent,
@@ -21,6 +24,7 @@ import {
   type CodeEvent,
 } from "./protocol.ts";
 
+const isCommandError = Schema.is(CommandError);
 const encode = (record: unknown) => new TextEncoder().encode(`${JSON.stringify(record)}\n`);
 const receipt = {
   type: "status",
@@ -334,8 +338,10 @@ it.effect("honors the caller's command timeout and releases the scoped process",
   Effect.gen(function* () {
     const started = yield* Deferred.make<void>();
     const released = yield* Deferred.make<void>();
-    const spawner = ChildProcessSpawner.make(() =>
+    const spawner = ChildProcessSpawner.make((command) =>
       Effect.gen(function* () {
+        assert(command._tag === "StandardCommand");
+        assert.equal(command.options.forceKillAfter, "1 second");
         yield* Effect.addFinalizer(() => Deferred.succeed(released, undefined));
         yield* Deferred.succeed(started, undefined);
         return ChildProcessSpawner.makeHandle({
@@ -370,4 +376,112 @@ it.effect("honors the caller's command timeout and releases the scoped process",
     assert.equal(error.operation, "command timeout");
     yield* Deferred.await(released);
   }),
+);
+
+const collectOutput = Effect.fn("CodeRabbitProtocolTest.collectOutput")(function* (
+  stdout: ReadonlyArray<Uint8Array>,
+  stderr: ReadonlyArray<Uint8Array>,
+) {
+  const drained = yield* Deferred.make<void>();
+  const spawner = ChildProcessSpawner.make(() =>
+    Effect.succeed(
+      ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(123),
+        exitCode: Deferred.await(drained).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+        isRunning: Effect.succeed(false),
+        kill: () => Effect.void,
+        unref: Effect.succeed(Effect.void),
+        stdin: Sink.drain,
+        stdout: Stream.fromArray(stdout),
+        stderr: Stream.fromArray(stderr).pipe(
+          Stream.ensuring(Deferred.succeed(drained, undefined)),
+        ),
+        all: Stream.empty,
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+      }),
+    ),
+  );
+  return yield* collectCodeRabbitCommand("/fake/cr", ChildProcess.make("/fake/cr")).pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    Effect.provideService(HostProcess.Platform, "linux"),
+  );
+});
+
+it.effect("bounds collected stderr while draining through the child exit", () =>
+  Effect.gen(function* () {
+    const result = yield* collectOutput(
+      [new TextEncoder().encode("0.9.0")],
+      [new Uint8Array(65_536).fill(120), new Uint8Array(1_048_576).fill(120)],
+    );
+    assert.equal(result.stdout, "0.9.0");
+    assert.equal(result.stderr.length, 65_536);
+    assert.equal(result.code, 0);
+  }),
+);
+
+it.effect("rejects truncated stdout after draining both streams and awaiting exit", () =>
+  Effect.gen(function* () {
+    const prefix = new TextEncoder().encode('{"authenticated":true}');
+    const result = yield* collectOutput(
+      [prefix, new Uint8Array(1_048_576 - prefix.length).fill(32), new Uint8Array([32])],
+      [new Uint8Array(1_048_576).fill(120)],
+    ).pipe(Effect.flip);
+    assert(isCommandError(result));
+    assert.equal(result.operation, "read command output");
+  }),
+);
+
+it.effect("accepts stdout at the byte limit and rejects invalid UTF-8", () =>
+  Effect.gen(function* () {
+    const result = yield* collectOutput([new Uint8Array(1_048_576).fill(120)], []);
+    assert.equal(result.stdout.length, 1_048_576);
+    const error = yield* collectOutput([new Uint8Array([0xc3, 0x28])], []).pipe(Effect.flip);
+    assert(isCommandError(error));
+    assert.equal(error.operation, "read command output");
+  }),
+);
+
+it.live("force-kills a CLI that ignores SIGTERM when an event handler fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "coderabbit-force-kill-" });
+      const binaryPath = writeFakeCli({
+        directory: cwd,
+        name: "fake-cr",
+        source: `
+          import { MessageChannel } from 'node:worker_threads';
+          const { port1 } = new MessageChannel();
+          port1.on('message', () => {});
+          process.on('SIGTERM', () => {});
+          console.log(JSON.stringify({type:'ready',pid:process.pid}));
+        `,
+      });
+      let pid: number | undefined;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (pid === undefined) return;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }),
+      );
+      const error = yield* runCodeCommand({
+        binaryPath,
+        cwd,
+        args: [],
+        env: process.env,
+        onEvent: (event) => {
+          assert(event.type === "ready" && typeof event.pid === "number");
+          pid = event.pid;
+          return Effect.fail(new CommandError({ operation: "stop command" }));
+        },
+      }).pipe(Effect.flip);
+      assert.equal(error.operation, "stop command");
+      const exitedPid = pid;
+      assert(exitedPid !== undefined);
+      assert.throws(() => process.kill(exitedPid, 0), /ESRCH/);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
