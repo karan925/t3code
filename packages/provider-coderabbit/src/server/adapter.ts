@@ -41,7 +41,7 @@ import {
 } from "./protocol.ts";
 import { openInteractiveSession, type InteractiveSession } from "./session.ts";
 import { createTask, fetchLatestTurn } from "./tasks.ts";
-import { verifyCloudWorkspace } from "./workspace.ts";
+import { CloudWorkspaceError, readWorkspaceBranch, verifyCloudWorkspace } from "./workspace.ts";
 
 const CODERABBIT_PROVIDER = ProviderDriverKind.make("coderabbit");
 const DRIVER = CODERABBIT_PROVIDER;
@@ -149,6 +149,7 @@ interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurn: OrchestrationV2ProviderTurn;
   readonly messageReceipt: Deferred.Deferred<void>;
+  startFiber: Fiber.Fiber<void, IdAllocator.IdAllocatorV2AllocationError> | null;
   taskId: string | null;
   createdTask: boolean;
   taskURL: string | null;
@@ -399,7 +400,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             type: "turn_item.updated",
             driver: DRIVER,
             turnItem: {
-              ...itemBase(turn, `${turn.providerTurn.id}:failure`, at),
+              ...itemBase(turn, `terminal-failure:${turn.providerTurn.id}`, at),
               type: "error",
               status: "failed",
               failure,
@@ -1157,6 +1158,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             input: request,
             providerTurn,
             messageReceipt: yield* Deferred.make<void>(),
+            startFiber: null,
             taskId,
             createdTask: false,
             taskURL: taskId
@@ -1275,9 +1277,19 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               return;
             }
             if (taskId === null) {
-              const workspace = yield* verifyCloudWorkspace(cwd, options.environment).pipe(
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              );
+              const workspace = yield* Effect.gen(function* () {
+                for (let attempt = 0; attempt < 2; attempt++) {
+                  const verified = yield* verifyCloudWorkspace(
+                    cwd,
+                    options.environment,
+                    options.settings,
+                  );
+                  // The CLI reads HEAD itself; a rename after publication needs another preflight.
+                  if ((yield* readWorkspaceBranch(cwd, options.environment)) === verified.branch)
+                    return verified;
+                }
+                return yield* new CloudWorkspaceError({ reason: "branch_changed" });
+              }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
               if (turn.stopRequested || turn.finished) return;
               turn.submitted = true;
               task = yield* createTask({ ...taskOptions, prompt: text }).pipe(
@@ -1293,7 +1305,20 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               yield* say(
                 turn,
                 "cloud-task",
-                `Working in CodeRabbit: ${task.url}${workspace?.dirty ? "\nLocal uncommitted changes were not uploaded." : ""}`,
+                [
+                  `Working in CodeRabbit: ${task.url}`,
+                  ...(workspace.pushed
+                    ? [
+                        `Pushed \`${workspace.branch}\` to origin so CodeRabbit could start from it.`,
+                      ]
+                    : []),
+                  ...(workspace.localDiffers
+                    ? [
+                        `CodeRabbit started from \`${workspace.branch}\` on origin, which differs from your local copy.`,
+                      ]
+                    : []),
+                  ...(workspace.dirty ? ["Local uncommitted changes were not uploaded."] : []),
+                ].join("\n"),
               );
               yield* Deferred.succeed(turn.messageReceipt, undefined);
               yield* ensureInteractive();
@@ -1387,16 +1412,18 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                 yield* finish(
                   turn,
                   "failed",
-                  /auth/i.test(cause.message)
-                    ? "Run `cr auth login` on the T3 server host."
-                    : turn.taskId === null && turn.submitted
-                      ? `${cause.message} Check your CodeRabbit task list at app.coderabbit.ai before retrying.`
-                      : cause.message,
+                  cause._tag === "CodeRabbitWorkspaceError"
+                    ? cause.message
+                    : /auth/i.test(cause.message)
+                      ? "Run `cr auth login` on the T3 server host."
+                      : turn.taskId === null && turn.submitted
+                        ? `${cause.message} Check your CodeRabbit task list at app.coderabbit.ai before retrying.`
+                        : cause.message,
                 );
               }),
             ),
           );
-          yield* start.pipe(Effect.forkIn(scope));
+          turn.startFiber = yield* start.pipe(Effect.forkIn(scope));
         }),
         steerTurn: Effect.fn("CodeRabbit.steerTurn")(function* (request) {
           const turn = active;
@@ -1439,11 +1466,16 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         interruptTurn: Effect.fn("CodeRabbit.interruptTurn")(function* (request) {
           const turn = active;
           if (!turn || turn.finished || turn.providerTurn.id !== request.providerTurnId) return;
-          turn.stopRequested = true;
           if (turn.taskId === null && !turn.submitted) {
-            yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
+            yield* Effect.gen(function* () {
+              // Set inside the region: a stop flag without the matching finish would strand the turn.
+              turn.stopRequested = true;
+              if (turn.startFiber) yield* Fiber.interrupt(turn.startFiber);
+              yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
+            }).pipe(Effect.uninterruptible);
             return;
           }
+          turn.stopRequested = true;
           // Cancellation before admission can miss the queued message entirely.
           yield* Deferred.await(turn.messageReceipt);
           if (admissionUncertain)

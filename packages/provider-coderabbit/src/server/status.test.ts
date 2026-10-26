@@ -6,7 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { CodeRabbitSettings } from "../settings.ts";
-import { checkCodeRabbitProviderStatus } from "./status.ts";
+import { checkCodeRabbitProviderStatus, probeCodeRabbitOrganization } from "./status.ts";
 
 const settings = Schema.decodeSync(CodeRabbitSettings);
 const fakeCli = Effect.fn("CodeRabbitStatusTest.fakeCli")(function* (
@@ -39,6 +39,27 @@ const fakeCli = Effect.fn("CodeRabbitStatusTest.fakeCli")(function* (
 });
 
 describe("CodeRabbit status", () => {
+  it("enables automatic branch publishing by default and preserves an explicit opt-out", () => {
+    expect(settings({}).autoPushBranch).toBe(true);
+    expect(settings({ autoPushBranch: false }).autoPushBranch).toBe(false);
+  });
+
+  it.live("skips the organization probe when the CLI cannot be executed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.makeTempDirectoryScoped();
+        expect(
+          yield* probeCodeRabbitOrganization({
+            cwd,
+            binaryPath: "/missing/cr",
+            env: process.env,
+          }),
+        ).toBeUndefined();
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.live("does not execute the CLI while disabled", () =>
     Effect.scoped(
       Effect.gen(function* () {

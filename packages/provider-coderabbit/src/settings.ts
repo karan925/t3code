@@ -16,7 +16,16 @@ export const CodeRabbitSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "cr", clearWhenEmpty: "omit" },
       }),
     ),
+    autoPushBranch: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({
+        title: "Automatically push new branches",
+        description:
+          "Push the current branch to origin before starting a CodeRabbit task if it is not published yet. Existing origin branches are left unchanged.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
   },
-  { order: ["binaryPath"] },
+  { order: ["binaryPath", "autoPushBranch"] },
 );
 export type CodeRabbitSettings = typeof CodeRabbitSettings.Type;

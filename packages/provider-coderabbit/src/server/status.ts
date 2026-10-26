@@ -17,6 +17,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import type { CodeRabbitSettings } from "../settings.ts";
+import type { TaskCommandOptions } from "./tasks.ts";
 
 const PRESENTATION = {
   displayName: "CodeRabbit",
@@ -38,6 +39,41 @@ const AuthStatus = Schema.Struct({
   authenticated: Schema.Boolean,
 });
 const decodeAuthStatus = Schema.decodeUnknownOption(Schema.fromJsonString(AuthStatus));
+
+const decodeOrganization = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...AuthStatus.fields,
+      provider: Schema.Literal("github"),
+      currentOrg: Schema.Struct({ name: Schema.String }),
+    }),
+  ),
+);
+
+export const probeCodeRabbitOrganization = Effect.fn("CodeRabbit.probeOrganization")(
+  function* (options: TaskCommandOptions) {
+    const spawn = yield* resolveSpawnCommand(options.binaryPath, ["auth", "status", "--agent"], {
+      env: options.env,
+    });
+    const result = yield* spawnAndCollect(
+      options.binaryPath,
+      ChildProcess.make(spawn.command, spawn.args, {
+        cwd: options.cwd,
+        env: options.env,
+        extendEnv: false,
+        shell: spawn.shell,
+        stdin: "ignore",
+      }),
+    );
+    if (result.code !== 0) return undefined;
+    const auth = decodeOrganization(result.stdout.trim());
+    return Option.isSome(auth) && auth.value.authenticated
+      ? auth.value.currentOrg.name.trim() || undefined
+      : undefined;
+  },
+  Effect.timeout(AUTH_PROBE_TIMEOUT_MS),
+  Effect.orElseSucceed(() => undefined),
+);
 
 const snapshotForProbe = (input: {
   readonly enabled: boolean;
