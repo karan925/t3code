@@ -170,6 +170,7 @@ interface ActiveTurn {
   buffered: CodeEvent[];
   lastAssistantText: string | null;
   lastAssistantKey: string | null;
+  lastAssistantCreatedAt: DateTime.Utc | null;
   nextOrdinal: number;
   finished: boolean;
   resolvedQuestions: Set<string>;
@@ -279,9 +280,15 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       });
       const say = Effect.fnUntraced(function* (turn: ActiveTurn, key: string, text: string) {
         if (!text.trim()) return;
+        const at = yield* DateTime.now;
+        // Rewriting a message in place keeps when it was first said.
+        const createdAt =
+          key === turn.lastAssistantKey && turn.lastAssistantCreatedAt
+            ? turn.lastAssistantCreatedAt
+            : at;
         turn.lastAssistantText = text;
         turn.lastAssistantKey = key;
-        const at = yield* DateTime.now;
+        turn.lastAssistantCreatedAt = createdAt;
         const nativeId = `${turn.providerTurn.id}:${key}`;
         const messageId = ids.derive.messageFromProviderItem({
           driver: DRIVER,
@@ -292,6 +299,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           driver: DRIVER,
           turnItem: {
             ...itemBase(turn, nativeId, at),
+            startedAt: createdAt,
             type: "assistant_message",
             messageId,
             text,
@@ -313,7 +321,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             streaming: false,
             createdBy: "agent",
             creationSource: "provider",
-            createdAt: at,
+            createdAt,
             updatedAt: at,
           },
         });
@@ -1200,6 +1208,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             buffered: [],
             lastAssistantText: null,
             lastAssistantKey: null,
+            lastAssistantCreatedAt: null,
             nextOrdinal: 1,
             finished: false,
             resolvedQuestions: new Set(),

@@ -2597,6 +2597,7 @@ it.live.each(["Done in cloud", "Done in cloud\n  "])(
         assert(last);
         // The reply is rewritten in place with the footer, not followed by a separate summary.
         expect(last.id).toBe(streamed.id);
+        expect(last.createdAt).toEqual(streamed.createdAt);
         expect(last.text).toMatch(/^Done in cloud\n\n---\n\n- CodeRabbit task: /u);
         expect(messages.filter((message) => message.text.startsWith("- CodeRabbit task:"))).toEqual(
           [],
