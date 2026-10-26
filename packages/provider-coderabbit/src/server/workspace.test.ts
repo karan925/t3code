@@ -261,7 +261,7 @@ describe("CodeRabbit source workspace", () => {
             assert(command._tag === "StandardCommand");
             if (command.args[0] === "symbolic-ref") reads++;
             if (
-              (when === "temporary" && reads === 3 && command.args[0] === "symbolic-ref") ||
+              (when === "temporary" && reads === 2 && command.args[0] === "symbolic-ref") ||
               (when === "before-push" && command.args[0] === "ls-remote" && reads === 1)
             ) {
               yield* repo
@@ -310,8 +310,14 @@ describe("CodeRabbit source workspace", () => {
             return yield* original.spawn(command);
           }),
         );
-        yield* expectRejection(repo.local, repo.env, repo.settings, "git").pipe(
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        const failure = yield* expectRejection(
+          repo.local,
+          repo.env,
+          repo.settings,
+          "branch_changed",
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        expect(failure.message).toBe(
+          "The branch changed while CodeRabbit was preparing the task. Send your message again.",
         );
         expect(lookups).toBe(2);
         expect(
@@ -329,7 +335,7 @@ describe("CodeRabbit source workspace", () => {
         yield* repo.git(repo.local, ["checkout", "--no-track", "-b", branch]);
         expect(
           yield* verifyCloudWorkspace(repo.local, repo.env, repo.settings, {
-            branchRenameWaitMs: 1,
+            branchRenameWaitMs: 0,
           }),
         ).toMatchObject({ branch, pushed: true });
         yield* repo.git(repo.local, ["branch", "-m", "late-name"]);

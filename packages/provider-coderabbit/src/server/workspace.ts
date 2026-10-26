@@ -15,6 +15,7 @@ export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>
   {
     reason: Schema.Literals([
       "git",
+      "branch_changed",
       "unpublished",
       "push_failed",
       "push_unconfirmed",
@@ -33,6 +34,8 @@ export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>
         return this.branch
           ? `CodeRabbit needs the current branch published on origin. Push \`${this.branch}\` first before delegating.`
           : "CodeRabbit needs a published branch. Check out a branch and push it to origin first before delegating.";
+      case "branch_changed":
+        return "The branch changed while CodeRabbit was preparing the task. Send your message again.";
       case "git":
         return "Could not verify the CodeRabbit source branch. Check Git and origin access before delegating.";
       case "push_failed":
@@ -52,28 +55,50 @@ const githubOwner = (remote: string) =>
     remote,
   )?.[1];
 
+const workspaceGit = Effect.fn("CodeRabbit.workspaceGit")(function* (
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  args: ReadonlyArray<string>,
+  timeout = 30_000,
+) {
+  const spawn = yield* resolveSpawnCommand("git", args, { env });
+  return yield* spawnAndCollect(
+    "git",
+    ChildProcess.make(spawn.command, spawn.args, {
+      cwd,
+      env: { ...env, GIT_TERMINAL_PROMPT: "0" },
+      extendEnv: false,
+      shell: spawn.shell,
+      stdin: "ignore",
+    }),
+  ).pipe(Effect.timeout(timeout));
+});
+
+export const readWorkspaceBranch = Effect.fn("CodeRabbit.workspaceBranch")(
+  function* (cwd: string, env: NodeJS.ProcessEnv) {
+    const result = yield* workspaceGit(cwd, env, ["symbolic-ref", "--quiet", "HEAD"]);
+    if (result.code === 1 || (result.code === 0 && !result.stdout.startsWith("refs/heads/"))) {
+      return yield* new CloudWorkspaceError({ reason: "unpublished" });
+    }
+    if (result.code !== 0) return yield* new CloudWorkspaceError({ reason: "git" });
+    return result.stdout.trim().slice("refs/heads/".length);
+  },
+  (effect) =>
+    effect.pipe(
+      Effect.mapError((cause) =>
+        isCloudWorkspaceError(cause) ? cause : new CloudWorkspaceError({ reason: "git", cause }),
+      ),
+    ),
+);
+
 export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(function* (
   cwd: string,
   env: NodeJS.ProcessEnv,
   settings: Pick<CodeRabbitSettings, "binaryPath" | "autoPushBranch">,
   options: { readonly branchRenameWaitMs?: number } = {},
 ) {
-  const git = Effect.fn("CodeRabbit.workspaceGit")(function* (
-    args: ReadonlyArray<string>,
-    timeout = 30_000,
-  ) {
-    const spawn = yield* resolveSpawnCommand("git", args, { env });
-    return yield* spawnAndCollect(
-      "git",
-      ChildProcess.make(spawn.command, spawn.args, {
-        cwd,
-        env: { ...env, GIT_TERMINAL_PROMPT: "0" },
-        extendEnv: false,
-        shell: spawn.shell,
-        stdin: "ignore",
-      }),
-    ).pipe(Effect.timeout(timeout));
-  });
+  const git = (args: ReadonlyArray<string>, timeout?: number) =>
+    workspaceGit(cwd, env, args, timeout);
   const requiredGit = Effect.fn("CodeRabbit.requiredWorkspaceGit")(function* (
     args: ReadonlyArray<string>,
   ) {
@@ -90,16 +115,9 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
         return yield* new CloudWorkspaceError({ reason: "org_mismatch", org, owner });
       }
     }
-    const readBranch = Effect.fn("CodeRabbit.workspaceBranch")(function* () {
-      const result = yield* git(["symbolic-ref", "--quiet", "HEAD"]);
-      if (result.code === 1 || (result.code === 0 && !result.stdout.startsWith("refs/heads/"))) {
-        return yield* new CloudWorkspaceError({ reason: "unpublished" });
-      }
-      if (result.code !== 0) return yield* new CloudWorkspaceError({ reason: "git" });
-      return result.stdout.trim().slice("refs/heads/".length);
-    });
+    const readBranch = () => readWorkspaceBranch(cwd, env);
     let branch = yield* readBranch();
-    if (isTemporaryWorktreeBranch(branch)) {
+    if (isTemporaryWorktreeBranch(branch) && options.branchRenameWaitMs !== 0) {
       // Thread launch names worktrees asynchronously; do not publish the placeholder first.
       yield* readBranch().pipe(
         Effect.repeat({ while: isTemporaryWorktreeBranch, schedule: Schedule.spaced("1 second") }),
@@ -152,7 +170,7 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
         }
         return { pushed, localDiffers: remote.split(/\s+/u)[0] !== head };
       }
-      return yield* new CloudWorkspaceError({ reason: "git" });
+      return yield* new CloudWorkspaceError({ reason: "branch_changed" });
     });
     const published = yield* publish();
     const dirty =

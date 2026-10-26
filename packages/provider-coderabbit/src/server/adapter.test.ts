@@ -17,6 +17,7 @@ import {
 } from "@t3tools/contracts";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
@@ -252,15 +253,15 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
       directory: dir,
       name: "git",
       source: `
-    import {appendFileSync,writeFileSync,existsSync,watch} from "node:fs";
+    import {appendFileSync,readFileSync,writeFileSync,existsSync,watch} from "node:fs";
     import {createConnection} from "node:net";
     const args=process.argv.slice(2);
     appendFileSync(${JSON.stringify(log)},JSON.stringify({git:args})+'\\n');
-    if(args[0]==='symbolic-ref') console.log('refs/heads/main');
     if(args[0]==='rev-parse') console.log('abcdef');
     if(args[0]==='remote') console.log(${JSON.stringify(options.originUrl ?? "https://example.test/owner/repo.git")});
     ${syncSource}
     ${script(options.preflight ?? "")}
+    if(args[0]==='symbolic-ref') console.log('refs/heads/main');
     if(args[0]==='push') writeFileSync(signal('pushed'),'1');
     if(args[0]==='ls-remote' && (!${options.unpublished ?? false} || existsSync(signal('pushed')))) console.log('${options.localDiffers ? "fedcba" : "abcdef"}\\trefs/heads/main');
     if(args[0]==='status') console.log(' M changed.ts');
@@ -539,6 +540,7 @@ it.live(
           ["rev-parse", "HEAD"],
           ["ls-remote", "--heads", "origin", "refs/heads/main"],
           ["status", "--porcelain", "--untracked-files=normal"],
+          ["symbolic-ref", "--quiet", "HEAD"],
         ]);
         expect(calls.filter((call) => call.args).map((call) => call.args)).toEqual([
           ["code", "new", "-", "--agent"],
@@ -626,6 +628,68 @@ it.live("publishes a missing branch by default before creating the cloud task", 
           }),
         }),
       );
+    }),
+  ),
+);
+
+it.live("publishes a branch renamed after preflight before creating the task", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        preflight: `
+          if(args[0]==='status') writeFileSync(signal('renamed'),'1');
+          if(args[0]==='symbolic-ref') {
+            console.log('refs/heads/'+(existsSync(signal('renamed'))?'renamed':'main'));
+            process.exit(0);
+          }
+          if(args[0]==='ls-remote' && args[3]==='refs/heads/renamed' && !existsSync(signal('pushed'))) process.exit(0);
+        `,
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      expect((yield* f.terminal).status).toBe("completed");
+      const calls = yield* f.calls;
+      const push = calls.findIndex((call) => call.git?.[0] === "push");
+      expect(calls[push]?.git).toEqual([
+        "push",
+        "-u",
+        "origin",
+        "refs/heads/renamed:refs/heads/renamed",
+      ]);
+      expect(push).toBeLessThan(calls.findIndex((call) => call.args?.[1] === "new"));
+      expect(calls.filter((call) => call.git?.[0] === "remote")).toHaveLength(2);
+      expect(f.allEvents).toContainEqual(
+        expect.objectContaining({
+          type: "message.updated",
+          message: expect.objectContaining({
+            text: expect.stringContaining("Pushed `renamed` to origin"),
+          }),
+        }),
+      );
+    }),
+  ),
+);
+
+it.live("rejects a branch that keeps changing after workspace verification", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        initialTask: null,
+        preflight: `
+          const count=existsSync(signal('renames'))?Number(readFileSync(signal('renames'),'utf8')):0;
+          if(args[0]==='status') writeFileSync(signal('renames'),String(count+1));
+          if(args[0]==='symbolic-ref') {console.log('refs/heads/branch-'+count);process.exit(0);}
+        `,
+      });
+      yield* f.runtime.startTurn(f.turnInput);
+      const terminal = yield* f.terminal;
+      expect(terminal.status).toBe("failed");
+      expect(terminal.failure?.message).toBe(
+        "The branch changed while CodeRabbit was preparing the task. Send your message again.",
+      );
+      const calls = yield* f.calls;
+      expect(calls.filter((call) => call.git?.[0] === "remote")).toHaveLength(2);
+      expect(calls.filter((call) => call.args)).toEqual([]);
     }),
   ),
 );
@@ -2435,6 +2499,53 @@ it.live("Stop during workspace preflight cancels without creating a cloud task",
       expect((yield* f.terminal).status).toBe("cancelled");
       yield* f.mark("release-preflight");
       expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+    }),
+  ),
+);
+
+it.live("finishes early Stop even when its caller is interrupted during preflight cleanup", () =>
+  live(
+    Effect.gen(function* () {
+      const original = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const cleaning = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          const handle = yield* original.spawn(command);
+          assert(command._tag === "StandardCommand");
+          if (command.args[0] === "ls-remote") {
+            yield* Effect.addFinalizer(() =>
+              Deferred.succeed(cleaning, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            );
+          }
+          return handle;
+        }),
+      );
+      const f = yield* fixture({
+        initialTask: null,
+        preflight: "if(args[0]==='ls-remote'){mark('preflight');await wait('release-preflight');}",
+      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+      yield* f.runtime.startTurn(f.turnInput);
+      const started = yield* f.started;
+      yield* f.wait("preflight");
+      const cancel = yield* f.runtime
+        .interruptTurn({
+          providerThread: f.thread,
+          providerTurnId: started.id,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(cleaning);
+      const interrupt = yield* Fiber.interrupt(cancel).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(interrupt);
+      expect((yield* f.terminal).status).toBe("cancelled");
+      expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toHaveLength(1);
+      expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+      yield* f.mark("release-preflight");
+      yield* f.runtime.startTurn(nextTurn(f.turnInput, 2));
+      expect((yield* f.terminal).status).toBe("completed");
     }),
   ),
 );

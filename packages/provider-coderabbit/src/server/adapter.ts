@@ -41,7 +41,7 @@ import {
 } from "./protocol.ts";
 import { openInteractiveSession, type InteractiveSession } from "./session.ts";
 import { createTask, fetchLatestTurn } from "./tasks.ts";
-import { verifyCloudWorkspace } from "./workspace.ts";
+import { CloudWorkspaceError, readWorkspaceBranch, verifyCloudWorkspace } from "./workspace.ts";
 
 const CODERABBIT_PROVIDER = ProviderDriverKind.make("coderabbit");
 const DRIVER = CODERABBIT_PROVIDER;
@@ -1277,11 +1277,19 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               return;
             }
             if (taskId === null) {
-              const workspace = yield* verifyCloudWorkspace(
-                cwd,
-                options.environment,
-                options.settings,
-              ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+              const workspace = yield* Effect.gen(function* () {
+                for (let attempt = 0; attempt < 2; attempt++) {
+                  const verified = yield* verifyCloudWorkspace(
+                    cwd,
+                    options.environment,
+                    options.settings,
+                  );
+                  // The CLI reads HEAD itself; a rename after publication needs another preflight.
+                  if ((yield* readWorkspaceBranch(cwd, options.environment)) === verified.branch)
+                    return verified;
+                }
+                return yield* new CloudWorkspaceError({ reason: "branch_changed" });
+              }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
               if (turn.stopRequested || turn.finished) return;
               turn.submitted = true;
               task = yield* createTask({ ...taskOptions, prompt: text }).pipe(
@@ -1460,8 +1468,10 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           if (!turn || turn.finished || turn.providerTurn.id !== request.providerTurnId) return;
           turn.stopRequested = true;
           if (turn.taskId === null && !turn.submitted) {
-            if (turn.startFiber) yield* Fiber.interrupt(turn.startFiber);
-            yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
+            yield* Effect.gen(function* () {
+              if (turn.startFiber) yield* Fiber.interrupt(turn.startFiber);
+              yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
+            }).pipe(Effect.uninterruptible);
             return;
           }
           // Cancellation before admission can miss the queued message entirely.
