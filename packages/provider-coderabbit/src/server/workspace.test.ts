@@ -115,8 +115,8 @@ describe("CodeRabbit source workspace", () => {
         },
         {
           command: "git",
-          args: ["symbolic-ref", "--quiet", "--short", "HEAD"],
-          stdout: "unpublished-branch\n",
+          args: ["symbolic-ref", "--quiet", "HEAD"],
+          stdout: "refs/heads/unpublished-branch\n",
           exit: Effect.void,
         },
         {
@@ -130,6 +130,12 @@ describe("CodeRabbit source workspace", () => {
           args: ["ls-remote", "--heads", "origin", "refs/heads/unpublished-branch"],
           stdout: "",
           exit: Deferred.await(lookedUp),
+        },
+        {
+          command: "git",
+          args: ["symbolic-ref", "--quiet", "HEAD"],
+          stdout: "refs/heads/unpublished-branch\n",
+          exit: Effect.void,
         },
         {
           command: "git",
@@ -195,6 +201,7 @@ describe("CodeRabbit source workspace", () => {
       yield* TestClock.adjust("29 seconds");
       yield* Deferred.succeed(lookedUp, undefined);
       expect(yield* Queue.take(started)).toEqual(steps[5]!.args);
+      expect(yield* Queue.take(started)).toEqual(steps[6]!.args);
 
       // Slow preflight must not consume the push's own 60-second budget.
       yield* TestClock.adjust("52 seconds");
@@ -208,6 +215,7 @@ describe("CodeRabbit source workspace", () => {
       assert(isCloudWorkspaceError(result.failure));
       expect(result.failure.reason).toBe("push_failed");
       expect(result.failure.branch).toBe("unpublished-branch");
+      expect(result.failure.message).toContain("timed out");
       expect(result.failure.message).toContain("Push `unpublished-branch` manually");
       expect(result.failure.message).toContain("then send your message again");
       expect(commands).toEqual(steps.map(({ command, args }) => ({ command, args })));
@@ -224,6 +232,141 @@ describe("CodeRabbit source workspace", () => {
           pushed: false,
           localDiffers: false,
         });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("uses an unambiguous branch ref when a tag has the same name", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        yield* repo.git(repo.local, ["tag", "main"]);
+        expect((yield* verifyCloudWorkspace(repo.local, repo.env, repo.settings)).branch).toBe(
+          "main",
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live.each(["temporary", "before-push"] as const)("publishes the renamed branch (%s)", (when) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const initial = when === "temporary" ? "t3code/1234abcd" : "initial-name";
+        yield* repo.git(repo.local, ["checkout", "-b", initial]);
+        const original = yield* ChildProcessSpawner.ChildProcessSpawner;
+        let reads = 0;
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            assert(command._tag === "StandardCommand");
+            if (command.args[0] === "symbolic-ref") reads++;
+            if (
+              (when === "temporary" && reads === 3 && command.args[0] === "symbolic-ref") ||
+              (when === "before-push" && command.args[0] === "ls-remote" && reads === 1)
+            ) {
+              yield* repo
+                .git(repo.local, ["branch", "-m", "final-name"])
+                .pipe(
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, original),
+                  Effect.orDie,
+                );
+            }
+            return yield* original.spawn(command);
+          }),
+        );
+        const result = yield* verifyCloudWorkspace(repo.local, repo.env, repo.settings).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+        expect(result).toMatchObject({ branch: "final-name", pushed: true });
+        expect(
+          yield* repo.git(repo.local, ["ls-remote", "--heads", "origin", `refs/heads/${initial}`]),
+        ).toBe("");
+        expect(yield* repo.git(repo.local, ["rev-parse", "--abbrev-ref", "@{upstream}"])).toBe(
+          "origin/final-name",
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("stops retrying when the branch changes again before the second push attempt", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        yield* repo.git(repo.local, ["checkout", "-b", "initial-name"]);
+        const original = yield* ChildProcessSpawner.ChildProcessSpawner;
+        let lookups = 0;
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            assert(command._tag === "StandardCommand");
+            if (command.args[0] === "ls-remote") {
+              lookups++;
+              yield* repo
+                .git(repo.local, ["branch", "-m", `renamed-${lookups}`])
+                .pipe(
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, original),
+                  Effect.orDie,
+                );
+            }
+            return yield* original.spawn(command);
+          }),
+        );
+        yield* expectRejection(repo.local, repo.env, repo.settings, "git").pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+        expect(lookups).toBe(2);
+        expect(
+          yield* repo.git(repo.local, ["ls-remote", "--heads", "origin", "refs/heads/renamed-*"]),
+        ).toBe("");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("publishes a temporary branch after the deadline without setting an upstream", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const branch = "t3code/1234abcd";
+        yield* repo.git(repo.local, ["checkout", "--no-track", "-b", branch]);
+        expect(
+          yield* verifyCloudWorkspace(repo.local, repo.env, repo.settings, {
+            branchRenameWaitMs: 1,
+          }),
+        ).toMatchObject({ branch, pushed: true });
+        yield* repo.git(repo.local, ["branch", "-m", "late-name"]);
+        expect(
+          yield* repo.git(repo.local, [
+            "for-each-ref",
+            "--format=%(upstream)",
+            "refs/heads/late-name",
+          ]),
+        ).toBe("");
+        expect(
+          yield* repo.git(repo.local, ["ls-remote", "--heads", "origin", `refs/heads/${branch}`]),
+        ).not.toBe("");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("reports a successful push to a different push URL without asking to push again", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const pushOrigin = repo.path.join(repo.directory, "push.git");
+        yield* repo.git(repo.directory, ["init", "--bare", pushOrigin]);
+        yield* repo.git(repo.local, ["remote", "set-url", "--push", "origin", pushOrigin]);
+        yield* repo.git(repo.local, ["checkout", "-b", "different-push-url"]);
+        const failure = yield* expectRejection(
+          repo.local,
+          repo.env,
+          repo.settings,
+          "push_unconfirmed",
+        );
+        expect(failure.message).toContain("Pushed `different-push-url`");
+        expect(failure.message).toContain("different URL");
+        expect(failure.message).not.toContain("manually");
+        expect(yield* repo.git(pushOrigin, ["rev-parse", "refs/heads/different-push-url"])).toBe(
+          yield* repo.git(repo.local, ["rev-parse", "HEAD"]),
+        );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );
@@ -404,7 +547,7 @@ describe("CodeRabbit source workspace", () => {
           name: "pre-push",
           platform: "linux",
           source: `
-            process.stderr.write('verbose-prefix-' + 'x'.repeat(10000) + '\\nPermission denied by test hook\\n');
+            process.stderr.write('verbose-prefix-' + 'x'.repeat(10000) + '\\nhttps://user:' + 'private-password'.repeat(100) + '@example.test/repo?token=private-token\\nPermission denied by test hook\\n');
             process.exit(1);
           `,
         });
@@ -417,6 +560,9 @@ describe("CodeRabbit source workspace", () => {
         expect(failure.detail.length).toBeLessThanOrEqual(300);
         expect(failure.detail).toContain("Permission denied by test hook");
         expect(failure.detail).not.toContain("verbose-prefix-");
+        expect(failure.detail).not.toContain("private-password");
+        expect(failure.detail).not.toContain("private-token");
+        expect(failure.detail).toContain("https://example.test/repo");
         expect(failure.message).toContain(failure.detail);
         expect(
           yield* repo.git(repo.local, [

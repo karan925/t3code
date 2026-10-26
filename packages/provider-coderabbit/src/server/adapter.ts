@@ -149,6 +149,7 @@ interface ActiveTurn {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurn: OrchestrationV2ProviderTurn;
   readonly messageReceipt: Deferred.Deferred<void>;
+  startFiber: Fiber.Fiber<void, IdAllocator.IdAllocatorV2AllocationError> | null;
   taskId: string | null;
   createdTask: boolean;
   taskURL: string | null;
@@ -1157,6 +1158,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             input: request,
             providerTurn,
             messageReceipt: yield* Deferred.make<void>(),
+            startFiber: null,
             taskId,
             createdTask: false,
             taskURL: taskId
@@ -1304,7 +1306,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                     : []),
                   ...(workspace.localDiffers
                     ? [
-                        `CodeRabbit started from \`${workspace.branch}\` on origin, which differs from your local copy; unpushed local commits are not included.`,
+                        `CodeRabbit started from \`${workspace.branch}\` on origin, which differs from your local copy.`,
                       ]
                     : []),
                   ...(workspace.dirty ? ["Local uncommitted changes were not uploaded."] : []),
@@ -1413,7 +1415,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
               }),
             ),
           );
-          yield* start.pipe(Effect.forkIn(scope));
+          turn.startFiber = yield* start.pipe(Effect.forkIn(scope));
         }),
         steerTurn: Effect.fn("CodeRabbit.steerTurn")(function* (request) {
           const turn = active;
@@ -1458,6 +1460,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           if (!turn || turn.finished || turn.providerTurn.id !== request.providerTurnId) return;
           turn.stopRequested = true;
           if (turn.taskId === null && !turn.submitted) {
+            if (turn.startFiber) yield* Fiber.interrupt(turn.startFiber);
             yield* finish(turn, "cancelled").pipe(eventPermit.withPermits(1));
             return;
           }

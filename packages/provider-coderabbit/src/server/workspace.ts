@@ -1,5 +1,8 @@
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
-import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
+import { redactProviderFailureText } from "@t3tools/provider-core/server/failure";
+import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
+import * as Schedule from "effect/Schedule";
+import * as Cause from "effect/Cause";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -10,7 +13,13 @@ import { probeCodeRabbitOrganization } from "./status.ts";
 export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>()(
   "CodeRabbitWorkspaceError",
   {
-    reason: Schema.Literals(["git", "unpublished", "push_failed", "org_mismatch"]),
+    reason: Schema.Literals([
+      "git",
+      "unpublished",
+      "push_failed",
+      "push_unconfirmed",
+      "org_mismatch",
+    ]),
     branch: Schema.optional(Schema.String),
     detail: Schema.optional(Schema.String),
     org: Schema.optional(Schema.String),
@@ -28,6 +37,8 @@ export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>
         return "Could not verify the CodeRabbit source branch. Check Git and origin access before delegating.";
       case "push_failed":
         return `CodeRabbit could not push \`${this.branch}\` to origin. Push \`${this.branch}\` manually, then send your message again.${this.detail ? ` Git: ${this.detail}` : ""}`;
+      case "push_unconfirmed":
+        return `Pushed \`${this.branch}\` but origin does not show it yet (origin may push to a different URL). Check the remote and try again.`;
       case "org_mismatch":
         return `CodeRabbit CLI is using the \`${this.org}\` organization, but this repository belongs to \`${this.owner}\`. Run \`cr auth logout && cr auth login\` on this machine, choose \`${this.owner}\`, then send your message again.`;
     }
@@ -45,6 +56,7 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
   cwd: string,
   env: NodeJS.ProcessEnv,
   settings: Pick<CodeRabbitSettings, "binaryPath" | "autoPushBranch">,
+  options: { readonly branchRenameWaitMs?: number } = {},
 ) {
   const git = Effect.fn("CodeRabbit.workspaceGit")(function* (
     args: ReadonlyArray<string>,
@@ -78,39 +90,74 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
         return yield* new CloudWorkspaceError({ reason: "org_mismatch", org, owner });
       }
     }
-    const branchResult = yield* git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    if (branchResult.code === 1) {
-      return yield* new CloudWorkspaceError({ reason: "unpublished" });
-    }
-    if (branchResult.code !== 0) return yield* new CloudWorkspaceError({ reason: "git" });
-    const branch = branchResult.stdout.trim();
-    const head = yield* requiredGit(["rev-parse", "HEAD"]);
-    const remoteArgs = ["ls-remote", "--heads", "origin", `refs/heads/${branch}`];
-    let remote = yield* requiredGit(remoteArgs);
-    let pushed = false;
-    if (!remote) {
-      if (!settings.autoPushBranch) {
-        return yield* new CloudWorkspaceError({ reason: "unpublished", branch });
+    const readBranch = Effect.fn("CodeRabbit.workspaceBranch")(function* () {
+      const result = yield* git(["symbolic-ref", "--quiet", "HEAD"]);
+      if (result.code === 1 || (result.code === 0 && !result.stdout.startsWith("refs/heads/"))) {
+        return yield* new CloudWorkspaceError({ reason: "unpublished" });
       }
-      const pushError = (cause?: unknown, detail?: string) =>
-        new CloudWorkspaceError({ reason: "push_failed", branch, cause, detail });
-      const push = yield* git(
-        ["push", "-u", "origin", `refs/heads/${branch}:refs/heads/${branch}`],
-        60_000,
-      ).pipe(Effect.mapError((cause) => pushError(cause)));
-      if (push.code !== 0) {
-        const detail = makeProviderFailure({
-          message: push.stderr.trim().slice(-300),
-        }).message.slice(0, 300);
-        return yield* pushError(undefined, push.stderr.trim() ? detail : undefined);
-      }
-      remote = yield* requiredGit(remoteArgs).pipe(Effect.mapError((cause) => pushError(cause)));
-      if (!remote) return yield* pushError();
-      pushed = true;
+      if (result.code !== 0) return yield* new CloudWorkspaceError({ reason: "git" });
+      return result.stdout.trim().slice("refs/heads/".length);
+    });
+    let branch = yield* readBranch();
+    if (isTemporaryWorktreeBranch(branch)) {
+      // Thread launch names worktrees asynchronously; do not publish the placeholder first.
+      yield* readBranch().pipe(
+        Effect.repeat({ while: isTemporaryWorktreeBranch, schedule: Schedule.spaced("1 second") }),
+        Effect.timeoutOption(options.branchRenameWaitMs ?? 30_000),
+      );
+      branch = yield* readBranch();
     }
+    const publish = Effect.fn("CodeRabbit.publishWorkspaceBranch")(function* () {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const head = yield* requiredGit(["rev-parse", "HEAD"]);
+        const remoteArgs = ["ls-remote", "--heads", "origin", `refs/heads/${branch}`];
+        let remote = yield* requiredGit(remoteArgs);
+        let pushed = false;
+        if (!remote) {
+          if (!settings.autoPushBranch) {
+            return yield* new CloudWorkspaceError({ reason: "unpublished", branch });
+          }
+          const current = yield* readBranch();
+          if (current !== branch) {
+            branch = current;
+            continue;
+          }
+          const pushError = (cause?: unknown, detail?: string) =>
+            new CloudWorkspaceError({ reason: "push_failed", branch, cause, detail });
+          // A late rename must not inherit an upstream pointing at a temporary branch.
+          const upstream = isTemporaryWorktreeBranch(branch) ? [] : ["-u"];
+          const push = yield* git(
+            ["push", ...upstream, "origin", `refs/heads/${branch}:refs/heads/${branch}`],
+            60_000,
+          ).pipe(
+            Effect.mapError((cause) =>
+              pushError(
+                cause,
+                Cause.isTimeoutError(cause) ? "Push timed out after 60 seconds." : undefined,
+              ),
+            ),
+          );
+          if (push.code !== 0) {
+            const detail = redactProviderFailureText(push.stderr).slice(-300);
+            return yield* pushError(undefined, detail || undefined);
+          }
+          remote = yield* requiredGit(remoteArgs).pipe(
+            Effect.mapError(
+              (cause) => new CloudWorkspaceError({ reason: "push_unconfirmed", branch, cause }),
+            ),
+          );
+          if (!remote)
+            return yield* new CloudWorkspaceError({ reason: "push_unconfirmed", branch });
+          pushed = true;
+        }
+        return { pushed, localDiffers: remote.split(/\s+/u)[0] !== head };
+      }
+      return yield* new CloudWorkspaceError({ reason: "git" });
+    });
+    const published = yield* publish();
     const dirty =
       (yield* requiredGit(["status", "--porcelain", "--untracked-files=normal"])) !== "";
-    return { branch, dirty, pushed, localDiffers: remote.split(/\s+/u)[0] !== head };
+    return { branch, dirty, ...published };
   }).pipe(
     Effect.mapError((cause) =>
       isCloudWorkspaceError(cause) ? cause : new CloudWorkspaceError({ reason: "git", cause }),

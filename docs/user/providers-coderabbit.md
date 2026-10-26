@@ -19,8 +19,9 @@ messages continue the same task. Delegation to CodeRabbit also requires the pare
 ## Work with cloud tasks
 
 Tasks start from the current branch on `origin`. By default, T3 Code pushes the branch if it does
-not exist on `origin` yet, including new worktree branches. Turn off **Automatically push new
-branches** in CodeRabbit's provider settings to publish branches manually instead.
+not exist on `origin` yet. For new worktrees, it waits up to 30 seconds for the branch name before
+publishing. Turn off **Automatically push new branches** in CodeRabbit's provider settings to
+publish branches manually instead.
 
 Existing origin branches are used as they are, even when your local copy differs. Commit and push
 any changes the task needs before sending it. T3 Code reports when it publishes a branch, when the

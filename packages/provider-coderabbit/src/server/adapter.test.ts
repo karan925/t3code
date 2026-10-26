@@ -15,6 +15,8 @@ import {
   ThreadId,
   type OrchestrationV2AppThread,
 } from "@t3tools/contracts";
+import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
@@ -128,6 +130,7 @@ interface FixtureOptions {
   readonly auth?: string;
   readonly show?: string;
   readonly preflight?: string;
+  readonly realGit?: boolean;
 }
 const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
   options: FixtureOptions = {},
@@ -244,15 +247,16 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     rl.on('close',async()=>{${script(options.eof ?? "process.exit(0);")}});
   `,
   });
-  writeFakeCli({
-    directory: dir,
-    name: "git",
-    source: `
+  if (!options.realGit)
+    writeFakeCli({
+      directory: dir,
+      name: "git",
+      source: `
     import {appendFileSync,writeFileSync,existsSync,watch} from "node:fs";
     import {createConnection} from "node:net";
     const args=process.argv.slice(2);
     appendFileSync(${JSON.stringify(log)},JSON.stringify({git:args})+'\\n');
-    if(args[0]==='symbolic-ref') console.log('main');
+    if(args[0]==='symbolic-ref') console.log('refs/heads/main');
     if(args[0]==='rev-parse') console.log('abcdef');
     if(args[0]==='remote') console.log(${JSON.stringify(options.originUrl ?? "https://example.test/owner/repo.git")});
     ${syncSource}
@@ -261,7 +265,53 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     if(args[0]==='ls-remote' && (!${options.unpublished ?? false} || existsSync(signal('pushed')))) console.log('${options.localDiffers ? "fedcba" : "abcdef"}\\trefs/heads/main');
     if(args[0]==='status') console.log(' M changed.ts');
   `,
+    });
+  const git = Effect.fn("CodeRabbitAdapterTest.git")(function* (args: ReadonlyArray<string>) {
+    const result = yield* spawnAndCollect(
+      "git",
+      ChildProcess.make("git", args, {
+        cwd: dir,
+        env: {
+          ...env,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: path.join(dir, "gitconfig"),
+          GIT_CONFIG_COUNT: "0",
+        },
+        extendEnv: false,
+        stdin: "ignore",
+      }),
+    );
+    expect(result.code, result.stderr).toBe(0);
+    return result.stdout.trim();
   });
+  if (options.realGit) {
+    yield* fs.writeFileString(path.join(dir, "gitconfig"), "");
+    yield* git(["init", "--bare", path.join(dir, "origin.git")]);
+    yield* git(["init", "--initial-branch=main"]);
+    yield* git([
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.test",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "Initial",
+    ]);
+    yield* git(["remote", "add", "origin", path.join(dir, "origin.git")]);
+    writeFakeCli({
+      directory: path.join(dir, ".git", "hooks"),
+      name: "pre-push",
+      platform: "linux",
+      source: `
+        import {writeFileSync} from 'node:fs';
+        import {createConnection} from 'node:net';
+        ${syncSource}
+        await mark('pushing');
+        await wait('release-push');
+      `,
+    });
+  }
   const wakes = yield* Queue.unbounded<ProviderContinuationRequest>();
   const adapter = yield* makeCodeRabbitAdapterV2({
     instanceId: INSTANCE,
@@ -270,7 +320,17 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
       binaryPath: binary,
       ...(options.autoPushBranch === undefined ? {} : { autoPushBranch: options.autoPushBranch }),
     }),
-    environment: { ...env, PATH: `${dir}${path.sep === "\\" ? ";" : ":"}${env.PATH ?? ""}` },
+    environment: {
+      ...env,
+      ...(options.realGit
+        ? {
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: path.join(dir, "gitconfig"),
+            GIT_CONFIG_COUNT: "0",
+          }
+        : {}),
+      PATH: `${dir}${path.sep === "\\" ? ";" : ":"}${env.PATH ?? ""}`,
+    },
   }).pipe(
     Effect.provideService(ProviderContinuationRequests, {
       offer: (request) => Queue.offer(wakes, request).pipe(Effect.asVoid),
@@ -444,6 +504,7 @@ const fixture = Effect.fn("CodeRabbitAdapterTest.fixture")(function* (
     started,
     assistant,
     wakes,
+    git,
   };
 });
 const live = <E>(
@@ -474,7 +535,7 @@ it.live(
         const calls = yield* f.calls;
         expect(calls.filter((call) => call.git).map((call) => call.git)).toEqual([
           ["remote", "get-url", "origin"],
-          ["symbolic-ref", "--quiet", "--short", "HEAD"],
+          ["symbolic-ref", "--quiet", "HEAD"],
           ["rev-parse", "HEAD"],
           ["ls-remote", "--heads", "origin", "refs/heads/main"],
           ["status", "--porcelain", "--untracked-files=normal"],
@@ -538,7 +599,7 @@ it.live("starts from an existing origin branch that differs from the local copy"
         expect.objectContaining({
           type: "message.updated",
           message: expect.objectContaining({
-            text: `Working in CodeRabbit: ${task.url}\nCodeRabbit started from \`main\` on origin, which differs from your local copy; unpushed local commits are not included.\nLocal uncommitted changes were not uploaded.`,
+            text: `Working in CodeRabbit: ${task.url}\nCodeRabbit started from \`main\` on origin, which differs from your local copy.\nLocal uncommitted changes were not uploaded.`,
           }),
         }),
       );
@@ -2373,6 +2434,23 @@ it.live("Stop during workspace preflight cancels without creating a cloud task",
       yield* f.runtime.interruptTurn({ providerThread: f.thread, providerTurnId: started.id });
       expect((yield* f.terminal).status).toBe("cancelled");
       yield* f.mark("release-preflight");
+      expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
+    }),
+  ),
+);
+
+it.live("Stop during a push kills preflight before publishing the branch", () =>
+  live(
+    Effect.gen(function* () {
+      const f = yield* fixture({ initialTask: null, realGit: true });
+      yield* f.runtime.startTurn(f.turnInput);
+      const started = yield* f.started;
+      yield* f.wait("pushing");
+      yield* f.runtime.interruptTurn({ providerThread: f.thread, providerTurnId: started.id });
+      expect((yield* f.terminal).status).toBe("cancelled");
+      yield* f.mark("release-push");
+      expect(yield* f.git(["ls-remote", "--heads", "origin", "refs/heads/main"])).toBe("");
+      expect(f.allEvents.filter((event) => event.type === "turn.terminal")).toHaveLength(1);
       expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
     }),
   ),
