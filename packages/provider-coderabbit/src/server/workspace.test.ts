@@ -139,6 +139,18 @@ describe("CodeRabbit source workspace", () => {
         },
         {
           command: "git",
+          args: ["remote", "get-url", "origin"],
+          stdout: "git@github.com:example/repo.git\n",
+          exit: Effect.void,
+        },
+        {
+          command: "git",
+          args: ["remote", "get-url", "--push", "origin"],
+          stdout: "https://github.com/Example/repo\n",
+          exit: Effect.void,
+        },
+        {
+          command: "git",
           args: [
             "push",
             "-u",
@@ -200,8 +212,9 @@ describe("CodeRabbit source workspace", () => {
       }
       yield* TestClock.adjust("29 seconds");
       yield* Deferred.succeed(lookedUp, undefined);
-      expect(yield* Queue.take(started)).toEqual(steps[5]!.args);
-      expect(yield* Queue.take(started)).toEqual(steps[6]!.args);
+      for (const step of steps.slice(5, 9)) {
+        expect(yield* Queue.take(started)).toEqual(step.args);
+      }
 
       // Slow preflight must not consume the push's own 60-second budget.
       yield* TestClock.adjust("52 seconds");
@@ -353,7 +366,7 @@ describe("CodeRabbit source workspace", () => {
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.live("reports a successful push to a different push URL without asking to push again", () =>
+  it.live("refuses to auto-push when origin pushes to a different repository", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const repo = yield* makeRepository();
@@ -365,14 +378,10 @@ describe("CodeRabbit source workspace", () => {
           repo.local,
           repo.env,
           repo.settings,
-          "push_unconfirmed",
+          "push_target_mismatch",
         );
-        expect(failure.message).toContain("Pushed `different-push-url`");
-        expect(failure.message).toContain("different URL");
-        expect(failure.message).not.toContain("manually");
-        expect(yield* repo.git(pushOrigin, ["rev-parse", "refs/heads/different-push-url"])).toBe(
-          yield* repo.git(repo.local, ["rev-parse", "HEAD"]),
-        );
+        expect(failure.message).toContain("`different-push-url`");
+        expect(yield* repo.git(pushOrigin, ["branch", "--list", "different-push-url"])).toBe("");
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );
@@ -542,7 +551,7 @@ describe("CodeRabbit source workspace", () => {
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.live("reports actionable push failures with capped Git stderr", () =>
+  it.live("keeps Git stderr out of push failure messages", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const repo = yield* makeRepository();
@@ -562,14 +571,9 @@ describe("CodeRabbit source workspace", () => {
         expect(failure.branch).toBe("rejected-branch");
         expect(failure.message).toContain("Push `rejected-branch` manually");
         expect(failure.message).toContain("then send your message again");
-        assert(failure.detail);
-        expect(failure.detail.length).toBeLessThanOrEqual(300);
-        expect(failure.detail).toContain("Permission denied by test hook");
-        expect(failure.detail).not.toContain("verbose-prefix-");
-        expect(failure.detail).not.toContain("private-password");
-        expect(failure.detail).not.toContain("private-token");
-        expect(failure.detail).toContain("https://example.test/repo");
-        expect(failure.message).toContain(failure.detail);
+        expect(failure.message).not.toContain("Permission denied by test hook");
+        expect(failure.message).not.toContain("private-password");
+        expect(failure.message).not.toContain("example.test");
         expect(
           yield* repo.git(repo.local, [
             "ls-remote",

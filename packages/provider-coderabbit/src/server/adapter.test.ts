@@ -657,7 +657,7 @@ it.live("publishes a branch renamed after preflight before creating the task", (
         "refs/heads/renamed:refs/heads/renamed",
       ]);
       expect(push).toBeLessThan(calls.findIndex((call) => call.args?.[1] === "new"));
-      expect(calls.filter((call) => call.git?.[0] === "remote")).toHaveLength(2);
+      expect(calls.filter((call) => call.git?.[0] === "remote")).toHaveLength(4);
       expect(f.allEvents).toContainEqual(
         expect.objectContaining({
           type: "message.updated",
@@ -707,7 +707,8 @@ it.live("does not create a task when publishing the branch fails", () =>
       expect(terminal.status).toBe("failed");
       expect(terminal.failure?.message).toContain("could not push `main` to origin");
       expect(terminal.failure?.message).toContain("Push `main` manually");
-      expect(terminal.failure?.message).toContain("push denied");
+      expect(terminal.failure?.message).toContain("could not push `main`");
+      expect(terminal.failure?.message).not.toContain("push denied");
       expect((yield* f.calls).filter((call) => call.args)).toEqual([]);
     }),
   ),

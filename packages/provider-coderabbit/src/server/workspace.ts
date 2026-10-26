@@ -19,10 +19,11 @@ export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>
       "unpublished",
       "push_failed",
       "push_unconfirmed",
+      "push_target_mismatch",
       "org_mismatch",
     ]),
     branch: Schema.optional(Schema.String),
-    detail: Schema.optional(Schema.String),
+    timedOut: Schema.optional(Schema.Boolean),
     org: Schema.optional(Schema.String),
     owner: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
@@ -39,9 +40,11 @@ export class CloudWorkspaceError extends Schema.TaggedError<CloudWorkspaceError>
       case "git":
         return "Could not verify the CodeRabbit source branch. Check Git and origin access before delegating.";
       case "push_failed":
-        return `CodeRabbit could not push \`${this.branch}\` to origin. Push \`${this.branch}\` manually, then send your message again.${this.detail ? ` Git: ${this.detail}` : ""}`;
+        return `CodeRabbit could not push \`${this.branch}\` to origin${this.timedOut ? " (timed out after 60 seconds)" : ""}. Push \`${this.branch}\` manually, then send your message again.`;
       case "push_unconfirmed":
         return `Pushed \`${this.branch}\` but origin does not show it yet (origin may push to a different URL). Check the remote and try again.`;
+      case "push_target_mismatch":
+        return `origin pushes to a different repository than it fetches from, so CodeRabbit won't push \`${this.branch}\` automatically. Push it to origin's fetch repository, then send your message again.`;
       case "org_mismatch":
         return `CodeRabbit CLI is using the \`${this.org}\` organization, but this repository belongs to \`${this.owner}\`. Run \`cr auth logout && cr auth login\` on this machine, choose \`${this.owner}\`, then send your message again.`;
     }
@@ -54,6 +57,20 @@ const githubOwner = (remote: string) =>
   /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/\s]+)\/[^/\s]+\/?$/iu.exec(
     remote,
   )?.[1];
+
+const githubRepository = (remote: string) => {
+  const match =
+    /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/iu.exec(
+      remote,
+    );
+  return match ? `${match[1]}/${match[2]}`.toLowerCase() : undefined;
+};
+
+// SSH and HTTPS URLs for one GitHub repository are the same publication target.
+const sameRepository = (fetchUrl: string, pushUrl: string) =>
+  fetchUrl === pushUrl ||
+  (githubRepository(fetchUrl) !== undefined &&
+    githubRepository(fetchUrl) === githubRepository(pushUrl));
 
 const workspaceGit = Effect.fn("CodeRabbit.workspaceGit")(function* (
   cwd: string,
@@ -140,24 +157,28 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
             branch = current;
             continue;
           }
-          const pushError = (cause?: unknown, detail?: string) =>
-            new CloudWorkspaceError({ reason: "push_failed", branch, cause, detail });
+          // The org check and ls-remote read the fetch URL; never publish somewhere else.
+          const fetchUrl = yield* requiredGit(["remote", "get-url", "origin"]);
+          const pushUrl = yield* requiredGit(["remote", "get-url", "--push", "origin"]);
+          if (!sameRepository(fetchUrl, pushUrl)) {
+            return yield* new CloudWorkspaceError({ reason: "push_target_mismatch", branch });
+          }
+          const pushError = (cause?: unknown, timedOut?: boolean) =>
+            new CloudWorkspaceError({ reason: "push_failed", branch, cause, timedOut });
           // A late rename must not inherit an upstream pointing at a temporary branch.
           const upstream = isTemporaryWorktreeBranch(branch) ? [] : ["-u"];
           const push = yield* git(
             ["push", ...upstream, "origin", `refs/heads/${branch}:refs/heads/${branch}`],
             60_000,
           ).pipe(
-            Effect.mapError((cause) =>
-              pushError(
-                cause,
-                Cause.isTimeoutError(cause) ? "Push timed out after 60 seconds." : undefined,
-              ),
-            ),
+            Effect.mapError((cause) => pushError(cause, Cause.isTimeoutError(cause) || undefined)),
           );
           if (push.code !== 0) {
-            const detail = redactProviderFailureText(push.stderr).slice(-300);
-            return yield* pushError(undefined, detail || undefined);
+            // Git output stays in the cause for diagnostics; the message is fixed text.
+            return yield* pushError({
+              exitCode: push.code,
+              stderr: redactProviderFailureText(push.stderr).slice(-300),
+            });
           }
           remote = yield* requiredGit(remoteArgs).pipe(
             Effect.mapError(
