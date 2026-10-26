@@ -169,6 +169,8 @@ interface ActiveTurn {
   readonly previousHead: OrchestrationV2ProviderThread["nativeConversationHeadRef"];
   buffered: CodeEvent[];
   lastAssistantText: string | null;
+  lastAssistantKey: string | null;
+  lastAssistantCreatedAt: DateTime.Utc | null;
   nextOrdinal: number;
   finished: boolean;
   resolvedQuestions: Set<string>;
@@ -278,8 +280,15 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
       });
       const say = Effect.fnUntraced(function* (turn: ActiveTurn, key: string, text: string) {
         if (!text.trim()) return;
-        turn.lastAssistantText = text;
         const at = yield* DateTime.now;
+        // Rewriting a message in place keeps when it was first said.
+        const createdAt =
+          key === turn.lastAssistantKey && turn.lastAssistantCreatedAt
+            ? turn.lastAssistantCreatedAt
+            : at;
+        turn.lastAssistantText = text;
+        turn.lastAssistantKey = key;
+        turn.lastAssistantCreatedAt = createdAt;
         const nativeId = `${turn.providerTurn.id}:${key}`;
         const messageId = ids.derive.messageFromProviderItem({
           driver: DRIVER,
@@ -290,6 +299,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           driver: DRIVER,
           turnItem: {
             ...itemBase(turn, nativeId, at),
+            startedAt: createdAt,
             type: "assistant_message",
             messageId,
             text,
@@ -311,7 +321,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             streaming: false,
             createdBy: "agent",
             creationSource: "provider",
-            createdAt: at,
+            createdAt,
             updatedAt: at,
           },
         });
@@ -581,17 +591,24 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         }
 
         const text = result.finalReply ?? result.errorMessage;
-        if (text && text !== turn.lastAssistantText) yield* say(turn, "result", text);
-        yield* say(
-          turn,
-          "delivery",
-          [
-            `CodeRabbit task: ${detail?.url ?? turn.taskURL}`,
-            `Working branch: ${detail?.workingBranchName ?? "pending"}`,
-            `Patch: ${detail?.patchStatus ?? "unknown"}; delivery: ${detail?.deliveryStatus ?? "unknown"}.`,
-            `Results stay in the cloud. Deliver with \`cr code push ${turn.taskId}\` or the web app.`,
-          ].join("\n"),
-        );
+        const patchStatus = detail?.patchStatus;
+        const footer = [
+          `- CodeRabbit task: ${detail?.url ?? turn.taskURL}`,
+          `- Working branch: \`${detail?.workingBranchName ?? "pending"}\``,
+          // Without confirmed task details there is nothing known to deliver.
+          ...(patchStatus === undefined || patchStatus === null || patchStatus === "none"
+            ? []
+            : [
+                `- Patch: ${patchStatus}; delivery: ${detail?.deliveryStatus ?? "unknown"}. Deliver with \`cr code push ${turn.taskId}\` or the web app.`,
+              ]),
+        ].join("\n");
+        // The thread shows a turn's last message as its answer, so the reply must carry the footer.
+        // A reply already streamed from the trace is rewritten in place rather than repeated.
+        const replyKey =
+          text && text.trimEnd() === turn.lastAssistantText?.trimEnd() && turn.lastAssistantKey
+            ? turn.lastAssistantKey
+            : "result";
+        yield* say(turn, replyKey, text ? `${text}\n\n---\n\n${footer}` : footer);
         yield* finish(
           turn,
           result.outcome === "canceled" ? "cancelled" : result.outcome,
@@ -1190,6 +1207,8 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
             previousHead: thread.nativeConversationHeadRef,
             buffered: [],
             lastAssistantText: null,
+            lastAssistantKey: null,
+            lastAssistantCreatedAt: null,
             nextOrdinal: 1,
             finished: false,
             resolvedQuestions: new Set(),
