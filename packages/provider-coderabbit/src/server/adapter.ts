@@ -583,11 +583,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         }
 
         const text = result.finalReply ?? result.errorMessage;
-        const patchStatus = detail?.patchStatus ?? "unknown";
+        const patchStatus = detail?.patchStatus;
         const footer = [
           `- CodeRabbit task: ${detail?.url ?? turn.taskURL}`,
           `- Working branch: \`${detail?.workingBranchName ?? "pending"}\``,
-          ...(patchStatus === "none"
+          // Without confirmed task details there is nothing known to deliver.
+          ...(patchStatus === undefined || patchStatus === null || patchStatus === "none"
             ? []
             : [
                 `- Patch: ${patchStatus}; delivery: ${detail?.deliveryStatus ?? "unknown"}. Deliver with \`cr code push ${turn.taskId}\` or the web app.`,
@@ -596,7 +597,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
         // The thread shows a turn's last message as its answer, so the reply must carry the footer.
         // A reply already streamed from the trace is rewritten in place rather than repeated.
         const replyKey =
-          text && text === turn.lastAssistantText && turn.lastAssistantKey
+          text && text.trimEnd() === turn.lastAssistantText?.trimEnd() && turn.lastAssistantKey
             ? turn.lastAssistantKey
             : "result";
         yield* say(turn, replyKey, text ? `${text}\n\n---\n\n${footer}` : footer);

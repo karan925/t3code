@@ -2578,29 +2578,31 @@ it.live("Stop during a push kills preflight before publishing the branch", () =>
   ),
 );
 
-it.live("ends the turn with the streamed reply and its task footer as the last message", () =>
-  live(
-    Effect.gen(function* () {
-      const f = yield* fixture({
-        message: "ack(req);trace('agent_message',{text:'Done in cloud'});end();",
-      });
-      yield* f.runtime.startTurn(f.turnInput);
-      expect((yield* f.terminal).status).toBe("completed");
-      const messages = f.allEvents.flatMap((event) =>
-        event.type === "message.updated" ? [event.message] : [],
-      );
-      const streamed = messages.find((message) => message.text === "Done in cloud");
-      assert(streamed);
-      const last = messages.at(-1);
-      assert(last);
-      // The reply is rewritten in place with the footer, not followed by a separate summary.
-      expect(last.id).toBe(streamed.id);
-      expect(last.text).toMatch(/^Done in cloud\n\n---\n\n- CodeRabbit task: /u);
-      expect(messages.filter((message) => message.text.startsWith("- CodeRabbit task:"))).toEqual(
-        [],
-      );
-    }),
-  ),
+it.live.each(["Done in cloud", "Done in cloud\n  "])(
+  "ends the turn with the streamed reply and its task footer as the last message (%j)",
+  (streamedText) =>
+    live(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          message: `ack(req);trace('agent_message',{text:${JSON.stringify(streamedText)}});end();`,
+        });
+        yield* f.runtime.startTurn(f.turnInput);
+        expect((yield* f.terminal).status).toBe("completed");
+        const messages = f.allEvents.flatMap((event) =>
+          event.type === "message.updated" ? [event.message] : [],
+        );
+        const streamed = messages.find((message) => message.text.trimEnd() === "Done in cloud");
+        assert(streamed);
+        const last = messages.at(-1);
+        assert(last);
+        // The reply is rewritten in place with the footer, not followed by a separate summary.
+        expect(last.id).toBe(streamed.id);
+        expect(last.text).toMatch(/^Done in cloud\n\n---\n\n- CodeRabbit task: /u);
+        expect(messages.filter((message) => message.text.startsWith("- CodeRabbit task:"))).toEqual(
+          [],
+        );
+      }),
+    ),
 );
 
 it.live.each([true, false])("refreshes delivery metadata with show (success=%s)", (success) =>
