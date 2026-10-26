@@ -71,10 +71,12 @@ export const openInteractiveSession = Effect.fn("CodeRabbit.openInteractiveSessi
   const failTransport = Effect.fn("CodeRabbit.failTransport")(function* (error: CommandError) {
     yield* failPending(error);
     yield* endOutgoing;
+    // Deliver captured frames before the error; finalization releases an abandoned bounded backlog.
     yield* Queue.fail(incoming, error);
-    // Effect 4 preserves a closing queue's failure when shutdown discards its buffered frames.
-    yield* Queue.shutdown(incoming);
-    bufferedEventBytes = 0;
+    yield* Effect.logWarning("CodeRabbit transport failed", {
+      taskId: options.taskId,
+      operation: error.operation,
+    });
   });
   yield* Effect.addFinalizer(() =>
     failPending(new CommandError({ operation: "session closed" })).pipe(

@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Queue from "effect/Queue";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
@@ -469,4 +470,34 @@ it.live("scope cleanup force-kills an interactive child that resists SIGTERM", (
       }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("delivers already-buffered frames before a transport failure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const failed = yield* Deferred.make<void>();
+      const logger = Logger.make(({ message }) => {
+        if (encodeJson(message).includes("CodeRabbit transport failed"))
+          Deferred.doneUnsafe(failed, Effect.void);
+      });
+      yield* Effect.gen(function* () {
+        const { session, writes, emit } = yield* makeSessionFixture();
+        const request = yield* session.request({ command: "show" }).pipe(Effect.forkScoped);
+        yield* Queue.take(writes);
+        yield* emit(ready, { type: "oversized", text: "x".repeat(1_048_576) });
+        assert.equal(
+          (yield* Fiber.join(request).pipe(Effect.flip)).operation,
+          "read oversized frame",
+        );
+        yield* Deferred.await(failed);
+        const observed: unknown[] = [];
+        const error = yield* Stream.runForEach(session.frames, (frame) =>
+          Effect.sync(() => observed.push(frame)),
+        ).pipe(Effect.flip);
+        assert.equal(error.operation, "read oversized frame");
+        assert.deepEqual(observed, [ready]);
+        yield* session.close;
+      }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+    }),
+  ),
 );
