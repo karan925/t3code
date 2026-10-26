@@ -159,8 +159,9 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
           }
           // The org check and ls-remote read the fetch URL; never publish somewhere else.
           const fetchUrl = yield* requiredGit(["remote", "get-url", "origin"]);
-          const pushUrl = yield* requiredGit(["remote", "get-url", "--push", "origin"]);
-          if (!sameRepository(fetchUrl, pushUrl)) {
+          // `git push` publishes to every push URL, so each one must match.
+          const pushUrls = yield* requiredGit(["remote", "get-url", "--push", "--all", "origin"]);
+          if (!pushUrls.split("\n").every((pushUrl) => sameRepository(fetchUrl, pushUrl.trim()))) {
             return yield* new CloudWorkspaceError({ reason: "push_target_mismatch", branch });
           }
           const pushError = (cause?: unknown, timedOut?: boolean) =>
@@ -177,7 +178,7 @@ export const verifyCloudWorkspace = Effect.fn("CodeRabbit.verifyWorkspace")(func
             // Git output stays in the cause for diagnostics; the message is fixed text.
             return yield* pushError({
               exitCode: push.code,
-              stderr: redactProviderFailureText(push.stderr).slice(-300),
+              stderr: redactProviderFailureText(push.stderr),
             });
           }
           remote = yield* requiredGit(remoteArgs).pipe(

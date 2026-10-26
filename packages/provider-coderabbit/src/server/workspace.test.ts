@@ -145,8 +145,8 @@ describe("CodeRabbit source workspace", () => {
         },
         {
           command: "git",
-          args: ["remote", "get-url", "--push", "origin"],
-          stdout: "https://github.com/Example/repo\n",
+          args: ["remote", "get-url", "--push", "--all", "origin"],
+          stdout: "https://github.com/Example/repo\ngit@github.com:example/repo.git\n",
           exit: Effect.void,
         },
         {
@@ -362,6 +362,37 @@ describe("CodeRabbit source workspace", () => {
         expect(
           yield* repo.git(repo.local, ["ls-remote", "--heads", "origin", `refs/heads/${branch}`]),
         ).not.toBe("");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("refuses to auto-push when any of origin's push URLs is a different repository", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const repo = yield* makeRepository();
+        const originUrl = yield* repo.git(repo.local, ["remote", "get-url", "origin"]);
+        const otherOrigin = repo.path.join(repo.directory, "other.git");
+        yield* repo.git(repo.directory, ["init", "--bare", otherOrigin]);
+        yield* repo.git(repo.local, ["remote", "set-url", "--add", "--push", "origin", originUrl]);
+        yield* repo.git(repo.local, [
+          "remote",
+          "set-url",
+          "--add",
+          "--push",
+          "origin",
+          otherOrigin,
+        ]);
+        yield* repo.git(repo.local, ["checkout", "-b", "second-push-url"]);
+        yield* expectRejection(repo.local, repo.env, repo.settings, "push_target_mismatch");
+        expect(yield* repo.git(otherOrigin, ["branch", "--list", "second-push-url"])).toBe("");
+        expect(
+          yield* repo.git(repo.local, [
+            "ls-remote",
+            "--heads",
+            "origin",
+            "refs/heads/second-push-url",
+          ]),
+        ).toBe("");
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );
