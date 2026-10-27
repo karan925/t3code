@@ -91,6 +91,7 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
@@ -528,6 +529,10 @@ export interface ProjectionStoreV2Shape {
     ReadonlyArray<{ readonly parentThreadId: ThreadId; readonly taskId: NodeId }>,
     ProjectionStoreV2Error
   >;
+  readonly getThreadIdsByWorkspace: (input: {
+    readonly branch: string;
+    readonly worktreePath: string;
+  }) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
   readonly getTurnStartContext: (
     threadId: ThreadId,
     runId: RunId,
@@ -6377,6 +6382,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    const getThreadIdsByWorkspace = Effect.fn("ProjectionStore.getThreadIdsByWorkspace")(
+      function* (input: { readonly branch: string; readonly worktreePath: string }) {
+        return yield* sql<{ readonly thread_id: string }>`
+          SELECT thread_id
+          FROM orchestration_v2_projection_threads
+          WHERE deleted_at IS NULL
+            AND json_extract(payload_json, '$.branch') = ${input.branch}
+            AND json_extract(payload_json, '$.worktreePath') = ${input.worktreePath}
+          ORDER BY thread_id
+        `.pipe(Effect.map((rows) => rows.map((row) => ThreadId.make(row.thread_id))));
+      },
+      NodeSqliteClient.readOnly,
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const shellThreadStateFromRow =
       /* Runs once per shell row; the enclosing snapshot or thread read owns the span. */
       Effect.fnUntraced(function* (input: {
@@ -6863,6 +6883,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
+      getThreadIdsByWorkspace: readOnReader(getThreadIdsByWorkspace),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
       getThreadProjection,
       getTurnStartContext: readOnReader(getTurnStartContext),
@@ -7117,6 +7138,20 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           ),
         ),
       getOpenRemoteDelegatedTasks: Effect.succeed([]),
+      getThreadIdsByWorkspace: (input) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()]
+              .filter(
+                ({ thread }) =>
+                  thread.deletedAt === null &&
+                  thread.branch === input.branch &&
+                  thread.worktreePath === input.worktreePath,
+              )
+              .map(({ thread }) => thread.id)
+              .toSorted(),
+          ),
+        ),
       getThreadsWithPullRequests: (threadId) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>

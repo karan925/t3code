@@ -2071,6 +2071,123 @@ it.effect("cancels tracked setup before provider work is released", () =>
   }),
 );
 
+it.effect(
+  "renames sharing threads without loading history and preserves concurrent workspace changes",
+  () =>
+    Effect.gen(function* () {
+      const branchNameStarted = yield* Deferred.make<void>();
+      const allowBranchName = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        generateBranchName: () =>
+          Deferred.succeed(branchNameStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(allowBranchName)),
+            Effect.as({ branch: "generated-branch" }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const input = launchInput({
+          command: "launch:sharing-rename",
+          thread: "thread:sharing-parent",
+          message: "Start",
+          workspace: { type: "worktree", baseRef: "main" },
+        });
+        const launched = yield* launches.launch(input);
+        yield* Deferred.await(branchNameStarted);
+        const parent = (yield* threads.getThreadProjection(launched.threadId)).thread;
+        assert.isNotNull(parent.branch);
+        assert.isNotNull(parent.worktreePath);
+        const oldBranch = parent.branch!;
+        const worktreePath = parent.worktreePath!;
+        const create = (id: string, branch = oldBranch, path = worktreePath) =>
+          threads.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`create:${id}`),
+            threadId: ThreadId.make(id),
+            projectId,
+            title: id,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch,
+            worktreePath: path,
+            createdBy: "user",
+            creationSource: "web",
+          });
+        yield* create("thread:sharing-active");
+        yield* create("thread:sharing-archived");
+        yield* threads.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("archive:sharing"),
+          threadId: ThreadId.make("thread:sharing-archived"),
+        });
+        yield* create("thread:other-branch", "other-branch");
+        yield* create("thread:other-path", oldBranch, "/other-worktree");
+        yield* create("thread:changed-after-lookup");
+
+        using _snapshot = vi
+          .spyOn(threads, "getShellSnapshot")
+          .mockImplementation(() => Effect.die("Branch propagation must not load shell history"));
+        const lookup = threads.getThreadIdsByWorkspace;
+        let firstLookup = true;
+        using _lookup = vi
+          .spyOn(threads, "getThreadIdsByWorkspace")
+          .mockImplementation((workspace) =>
+            lookup(workspace).pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  if (!firstLookup) return;
+                  firstLookup = false;
+                  yield* threads.dispatch({
+                    type: "thread.metadata.update",
+                    commandId: CommandId.make("change:sharing-workspace"),
+                    threadId: ThreadId.make("thread:changed-after-lookup"),
+                    branch: "concurrently-changed",
+                    worktreePath: "/concurrently-changed",
+                  });
+                  yield* create("thread:late-sharing");
+                }).pipe(Effect.orDie),
+              ),
+            ),
+          );
+        yield* Deferred.succeed(allowBranchName, undefined);
+        yield* threads
+          .streamStoredEventsFrom({ threadId: ThreadId.make("thread:late-sharing") })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.commandId === `${input.commandId}:branch-rename:thread:late-sharing`,
+            ),
+            Stream.runHead,
+          );
+        for (const id of [
+          launched.threadId,
+          "thread:sharing-active",
+          "thread:sharing-archived",
+          "thread:late-sharing",
+        ]) {
+          const thread = (yield* threads.getThreadProjection(ThreadId.make(id))).thread;
+          assert.equal(thread.branch, "generated-branch");
+          assert.equal(thread.worktreePath, worktreePath);
+        }
+        assert.equal(
+          (yield* threads.getThreadProjection(ThreadId.make("thread:other-branch"))).thread.branch,
+          "other-branch",
+        );
+        assert.equal(
+          (yield* threads.getThreadProjection(ThreadId.make("thread:other-path"))).thread.branch,
+          oldBranch,
+        );
+        const changed = (yield* threads.getThreadProjection(
+          ThreadId.make("thread:changed-after-lookup"),
+        )).thread;
+        assert.equal(changed.branch, "concurrently-changed");
+        assert.equal(changed.worktreePath, "/concurrently-changed");
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
 it.effect("stops an in-flight branch rename when tracked setup is cancelled", () =>
   Effect.gen(function* () {
     const setupEntered = yield* Deferred.make<void>();

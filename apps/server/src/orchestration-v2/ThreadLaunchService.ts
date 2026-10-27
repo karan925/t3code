@@ -513,21 +513,20 @@ const make = Effect.gen(function* () {
               // Update parents first so children inherit names; reread each pass for newly updated descendants.
               const visited = new Set([threadId]);
               while (true) {
-                const snapshot = yield* threads.getShellSnapshot();
-                const sharing = [...snapshot.threads, ...snapshot.archivedThreads].filter(
-                  (thread) =>
-                    !visited.has(thread.id) &&
-                    thread.worktreePath === worktreeCwd &&
-                    thread.branch === oldBranch,
-                );
+                const sharing = (yield* threads.getThreadIdsByWorkspace({
+                  branch: oldBranch,
+                  worktreePath: worktreeCwd,
+                })).filter((id) => !visited.has(id));
                 if (sharing.length === 0) break;
-                for (const thread of sharing) {
-                  visited.add(thread.id);
+                for (const sharingThreadId of sharing) {
+                  visited.add(sharingThreadId);
                   yield* threads
                     .dispatch({
                       type: "thread.metadata.update",
-                      commandId: CommandId.make(`${input.commandId}:branch-rename:${thread.id}`),
-                      threadId: thread.id,
+                      commandId: CommandId.make(
+                        `${input.commandId}:branch-rename:${sharingThreadId}`,
+                      ),
+                      threadId: sharingThreadId,
                       branch: renamed.branch,
                       expectedBranch: oldBranch,
                       expectedWorktreePath: worktreeCwd,
@@ -535,7 +534,7 @@ const make = Effect.gen(function* () {
                     .pipe(
                       Effect.catchCause((cause) =>
                         Effect.logWarning("Shared thread worktree branch update failed", {
-                          threadId: thread.id,
+                          threadId: sharingThreadId,
                           cause,
                         }),
                       ),

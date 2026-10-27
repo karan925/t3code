@@ -396,6 +396,9 @@ export interface OrchestratorV2Shape {
   readonly getShellSnapshot: (
     options?: ShellSnapshotOptions,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, OrchestratorV2Error>;
+  readonly getThreadIdsByWorkspace: (
+    input: Parameters<ProjectionStoreV2["Service"]["getThreadIdsByWorkspace"]>[0],
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
   readonly listActiveSubagentThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     OrchestratorV2Error
@@ -13477,6 +13480,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
       },
     ),
+    getThreadIdsByWorkspace: Effect.fn("OrchestratorV2.getThreadIdsByWorkspace")(function (input) {
+      return projectionStore
+        .getThreadIdsByWorkspace(input)
+        .pipe(Effect.mapError(shellProjectionError));
+    }),
     getShellSnapshot: Effect.fn("OrchestratorV2.getShellSnapshot")(function (options) {
       return projectionStore.getShellSnapshot(options).pipe(Effect.mapError(shellProjectionError));
     }),
