@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -27,8 +28,12 @@ import {
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -718,6 +723,111 @@ const threadWorktreePathsIncludeArchivedOnRequest = Effect.gen(function* () {
   ]);
 });
 
+const seedWorkspaceLookupThreads = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const workspace = { branch: "t3/workspace-lookup", worktreePath: "/worktrees/workspace-lookup" };
+  const create = (
+    suffix: string,
+    overrides: { branch?: string | null; worktreePath?: string | null; archived?: boolean } = {},
+  ) => {
+    const threadId = ThreadId.make(`thread:workspace-lookup:${suffix}`);
+    const thread = {
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      id: threadId,
+      projectId: ProjectId.make("project:workspace-lookup"),
+      title: suffix,
+      providerInstanceId,
+      modelSelection,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      branch: overrides.branch === undefined ? workspace.branch : overrides.branch,
+      worktreePath:
+        overrides.worktreePath === undefined ? workspace.worktreePath : overrides.worktreePath,
+      activeProviderThreadId: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: overrides.archived === true ? now : null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    return store
+      .apply({
+        id: EventId.make(`event:${threadId}:created`),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: thread,
+      })
+      .pipe(Effect.as(thread));
+  };
+  const active = yield* create("active");
+  const archived = yield* create("archived", { archived: true });
+  yield* create("other-branch", { branch: "another-branch" });
+  yield* create("other-path", { worktreePath: "/worktrees/another-workspace" });
+  yield* create("null-branch", { branch: null });
+  yield* create("null-path", { worktreePath: null });
+  const deleted = yield* create("deleted");
+  yield* store.apply({
+    id: EventId.make("event:workspace-lookup:deleted"),
+    type: "thread.deleted",
+    threadId: deleted.id,
+    occurredAt: now,
+    payload: { ...deleted, deletedAt: now },
+  });
+  return { workspace, expected: [active.id, archived.id] };
+});
+
+const workspaceLookupMatchesOnlyLiveWorkspaceThreads = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const { workspace, expected } = yield* seedWorkspaceLookupThreads;
+  assert.deepEqual(yield* store.getThreadIdsByWorkspace(workspace), expected);
+  assert.isEmpty(yield* store.getThreadIdsByWorkspace({ ...workspace, branch: "missing" }));
+  assert.isEmpty(yield* store.getThreadIdsByWorkspace({ ...workspace, worktreePath: "/missing" }));
+});
+
+it.layer(ProjectionStore.layerMemory)("ProjectionStoreV2 replay workspace lookup", (it) => {
+  it.effect(
+    "matches branch and path, includes archived threads and excludes deleted threads",
+    () => workspaceLookupMatchesOnlyLiveWorkspaceThreads,
+  );
+});
+
+it.effect("workspace lookup reads committed threads while the database writer is held", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-workspace-lookup-" });
+    const database = SqlitePersistence.layerFromPath(path.join(directory, "state.sqlite"));
+    yield* Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const { workspace, expected } = yield* seedWorkspaceLookupThreads;
+      const writerEntered = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const writer = yield* sql
+        .withTransaction(
+          Deferred.succeed(writerEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseWriter)),
+          ),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(writerEntered);
+      // Releasing the writer only after the lookup proves the read uses its separate connection.
+      const actual = yield* store
+        .getThreadIdsByWorkspace(workspace)
+        .pipe(Effect.ensuring(Deferred.succeed(releaseWriter, undefined)));
+      yield* Fiber.join(writer);
+      assert.deepEqual(actual, expected);
+    }).pipe(Effect.provide(ProjectionStore.layer.pipe(Layer.provideMerge(database))));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const now = yield* DateTime.now;
@@ -1138,6 +1248,32 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect(
     "worktree path lookup defaults to active threads and can include archived threads",
     () => threadWorktreePathsIncludeArchivedOnRequest,
+  );
+  it.effect(
+    "workspace lookup matches branch and path, includes archived and excludes deleted",
+    () => workspaceLookupMatchesOnlyLiveWorkspaceThreads,
+  );
+  it.effect("workspace lookup reads only matching thread IDs without loading histories", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const { statements, tracer } = traceSqlStatements();
+      const ids = yield* store
+        .getThreadIdsByWorkspace({
+          branch: "missing",
+          worktreePath: "/worktrees/missing",
+        })
+        .pipe(Effect.withTracer(tracer));
+      assert.isEmpty(ids);
+      assert.equal(statements.length, 1);
+      assert.match(
+        statements[0]!,
+        /^\s*SELECT thread_id\s+FROM orchestration_v2_projection_threads\s+WHERE/i,
+      );
+      assert.notMatch(
+        statements[0]!,
+        /\bJOIN\b|orchestration_v2_projection_(runs|turn_items|provider_threads)/i,
+      );
+    }),
   );
 
   it.effect(
