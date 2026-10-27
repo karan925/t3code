@@ -1,5 +1,6 @@
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
+  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_TEXT_GENERATION_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -9,6 +10,7 @@ import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@t3tools/contrac
 import { describe, expect, it } from "vite-plus/test";
 import { createModelSelection } from "@t3tools/shared/model";
 import { deriveEffectiveComposerModelState } from "./composerDraftStore";
+import { resolveComposerProviderSelection } from "./components/ChatView.logic";
 import { getComposerProviderState } from "./components/chat/composerProviderState";
 import { deriveProviderInstanceEntries, NO_PROVIDER_MODEL_SELECTION } from "./providerInstances";
 import {
@@ -779,4 +781,73 @@ describe("default model settings and new-thread composer parity", () => {
       expect(composerTraits.promptEffort).toBe(effort);
     },
   );
+});
+
+describe("CodeRabbit model selection", () => {
+  function setup() {
+    const instanceId = ProviderInstanceId.make("coderabbit");
+    const driver = ProviderDriverKind.make("coderabbit");
+    const codeRabbit: ServerProvider = {
+      ...provider({ provider: driver, instanceId, supportsTextGeneration: false }),
+      models: [{ slug: "default", name: "CodeRabbit", isCustom: false, capabilities: null }],
+    };
+    const settings: UnifiedSettings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: { [instanceId]: { driver, config: { enabled: true } } },
+    };
+    const providers = [provider({ instanceId: "codex", models: ["gpt-6-astra"] }), codeRabbit];
+    return { instanceId, driver, codeRabbit, providers, settings };
+  }
+
+  it("selects enabled CodeRabbit and resolves its default sentinel for new drafts", () => {
+    const { instanceId, driver, providers, settings } = setup();
+    const { selectedProviderEntry } = resolveComposerProviderSelection({
+      entries: deriveProviderInstanceEntries(providers),
+      candidateInstanceIds: [instanceId],
+      lockedProvider: null,
+      lockedInstanceId: null,
+    });
+    expect(selectedProviderEntry).toMatchObject({ instanceId, driverKind: driver, enabled: true });
+    expect(getAppModelOptionsForInstance(settings, selectedProviderEntry!)).toEqual([
+      { slug: "default", name: "CodeRabbit", isCustom: false },
+    ]);
+    expect(DEFAULT_MODEL_BY_PROVIDER[driver]).toBe("default");
+    expect(resolveAppModelSelectionForInstance(instanceId, settings, providers, null)).toBe(
+      "default",
+    );
+    expect(
+      resolveEffectiveDefaultModelSelection(settings, providers, {
+        instanceId,
+        model: DEFAULT_MODEL_BY_PROVIDER[driver]!,
+      }),
+    ).toEqual({ instanceId, model: "default" });
+  });
+
+  it("dispatches the CodeRabbit sentinel without options from another provider", () => {
+    const { instanceId, driver, codeRabbit, providers, settings } = setup();
+    const composer = deriveEffectiveComposerModelState({
+      draft: null,
+      providers,
+      selectedProvider: driver,
+      selectedInstanceId: instanceId,
+      threadModelSelection: null,
+      projectModelSelection: createModelSelection(instanceId, "gpt-6-astra", [
+        { id: "reasoningEffort", value: "high" },
+        { id: "fastMode", value: true },
+      ]),
+      settings,
+    });
+    const state = getComposerProviderState({
+      provider: driver,
+      model: composer.selectedModel,
+      models: codeRabbit.models,
+      modelOptions: composer.modelOptions?.[instanceId],
+      planModeEnabled: settings.planModeEnabled,
+    });
+
+    expect(
+      createModelSelection(instanceId, composer.selectedModel, state.modelOptionsForDispatch),
+    ).toEqual({ instanceId, model: "default" });
+    expect(state.promptEffort).toBeNull();
+  });
 });

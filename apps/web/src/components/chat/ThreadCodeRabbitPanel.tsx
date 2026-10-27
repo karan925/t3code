@@ -17,7 +17,7 @@ import {
 import {
   resolveThreadCurrentPullRequestLink,
   visibleThreadPullRequests,
-} from "@t3tools/shared/threadPullRequests";
+} from "@t3tools/client-runtime/thread-pull-requests";
 import { DownloadIcon, ScanSearchIcon, WrenchIcon, type LucideIcon } from "lucide-react";
 import { useState } from "react";
 
