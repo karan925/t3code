@@ -91,7 +91,6 @@ import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import type * as Statement from "effect/sql/Statement";
 
 import { MCP_APP_OUTPUT_KEY } from "@t3tools/shared/mcpApp";
@@ -6393,7 +6392,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           ORDER BY thread_id
         `.pipe(Effect.map((rows) => rows.map((row) => ThreadId.make(row.thread_id))));
       },
-      NodeSqliteClient.readOnly,
       Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
     );
 
