@@ -350,17 +350,13 @@ const encodeWireRequest = Schema.encodeEffect(Schema.fromJsonString(WireRequest)
   onExcessProperty: "error",
 });
 const validateRequest = Schema.decodeUnknownEffect(CodeRequest, { onExcessProperty: "error" });
-export const encodeCodeRequest = Effect.fn("CodeRabbit.encodeCodeRequest")(function* (
-  request: CodeRequest,
-  id: string,
-) {
-  const validated = yield* validateRequest(request).pipe(
-    Effect.mapError((cause) => new CommandError({ operation: "encode request", cause })),
-  );
-  return yield* encodeWireRequest({ ...validated, id }).pipe(
-    Effect.mapError((cause) => new CommandError({ operation: "encode request", cause })),
-  );
-});
+export const encodeCodeRequest = Effect.fn("CodeRabbit.encodeCodeRequest")(
+  function* (request: CodeRequest, id: string) {
+    const validated = yield* validateRequest(request);
+    return yield* encodeWireRequest({ ...validated, id });
+  },
+  Effect.mapError((cause) => new CommandError({ operation: "encode request", cause })),
+);
 
 export class CommandError extends Schema.TaggedError<CommandError>()("CodeRabbitCommandError", {
   operation: Schema.String,

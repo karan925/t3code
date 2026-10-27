@@ -1,3 +1,11 @@
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  defaultInstanceIdForDriver,
+  type ProviderInstanceConfigMap,
+} from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it, vi } from "@effect/vitest";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -6,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as CodeRabbitCli from "./CodeRabbitCli.ts";
@@ -86,28 +95,75 @@ describe("CodeRabbit CLI parsing", () => {
 });
 
 describe("CodeRabbitCli.status", () => {
-  const harness = (preview = output('{"type":"success"}')) => {
+  const harness = (
+    preview = output('{"type":"success"}'),
+    providerInstances: ProviderInstanceConfigMap = {},
+  ) => {
     const probe = vi
       .fn(() => output('{"authenticated":true,"user":{"username":"rabbit"}}'))
       .mockReturnValueOnce(output('{"authenticated":false}'));
-    const run: ProcessRunner.ProcessRunner["Service"]["run"] = (input) =>
+    const run = vi.fn<ProcessRunner.ProcessRunner["Service"]["run"]>((input) =>
       Effect.sync(() => {
         if (input.args[0] === "auth") return probe();
         return input.args.includes("--confirm") ? output('{"type":"success"}') : preview;
-      });
+      }),
+    );
     const layer = CodeRabbitCli.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
           ServerConfig.layerTest("/workspace", { prefix: "t3-coderabbit-cli-" }).pipe(
             Layer.provide(NodeServices.layer),
           ),
+          Layer.succeed(HostProcess.HomeDirectory, "/host/home"),
+          Layer.mock(ServerSettings.ServerSettingsService)({
+            getSettings: Effect.succeed({ ...DEFAULT_SERVER_SETTINGS, providerInstances }),
+          }),
           Layer.mock(ProcessRunner.ProcessRunner)({ run }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({ refresh: () => Effect.succeed([]) }),
         ),
       ),
     );
-    return { probe, layer };
+    return { probe, run, layer };
   };
+
+  it.effect.each([
+    ["implicit default", undefined, "cr"],
+    ["default settings", {}, "cr"],
+    ["blank binary path", { binaryPath: " " }, "cr"],
+    ["home-relative path", { binaryPath: "~/bin/cr" }, "/host/home/bin/cr"],
+    [
+      "disabled configured default",
+      { enabled: false, binaryPath: " /opt/coderabbit custom/cr " },
+      "/opt/coderabbit custom/cr",
+    ],
+  ] as const)("uses the %s binary for status and skills", ([, config, command]) => {
+    const driver = ProviderDriverKind.make("coderabbit");
+    const fixture = harness(output('{"type":"action_required","planHash":"plan-123"}', 1), {
+      [ProviderInstanceId.make("coderabbit-custom")]: {
+        driver,
+        enabled: true,
+        config: { binaryPath: "/other/cr" },
+      },
+      ...(config === undefined
+        ? {}
+        : {
+            [defaultInstanceIdForDriver(driver)]: { driver, enabled: false, config },
+          }),
+    });
+    return Effect.gen(function* () {
+      const cli = yield* CodeRabbitCli.CodeRabbitCli;
+      assert.deepEqual(yield* cli.status, { installed: true, authenticated: false, account: null });
+      yield* cli.installSkills;
+      assert.deepEqual(
+        fixture.run.mock.calls.map(([input]) => [input.command, input.args]),
+        [
+          [command, ["auth", "status", "--agent"]],
+          [command, ["skills", "install", "--agent"]],
+          [command, ["skills", "install", "--confirm", "plan-123"]],
+        ],
+      );
+    }).pipe(Effect.provide(fixture.layer));
+  });
 
   it.effect("reuses status for 30 seconds, then reads the CLI again on demand", () => {
     const fixture = harness();
@@ -171,6 +227,9 @@ describe("CodeRabbitCli.installSkills", () => {
           ServerConfig.layerTest("/workspace", { prefix: "t3-coderabbit-cli-" }).pipe(
             Layer.provide(NodeServices.layer),
           ),
+          Layer.mock(ServerSettings.ServerSettingsService)({
+            getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+          }),
           Layer.mock(ProcessRunner.ProcessRunner)({ run }),
           Layer.mock(ProviderRegistry.ProviderRegistry)({ refresh }),
         ),
@@ -210,6 +269,9 @@ describe("CodeRabbitCli.installSkills", () => {
               ServerConfig.layerTest("/workspace", { prefix: "t3-coderabbit-cli-" }).pipe(
                 Layer.provide(NodeServices.layer),
               ),
+              Layer.mock(ServerSettings.ServerSettingsService)({
+                getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+              }),
               Layer.mock(ProcessRunner.ProcessRunner)({ run }),
               Layer.mock(ProviderRegistry.ProviderRegistry)({ refresh }),
             ),

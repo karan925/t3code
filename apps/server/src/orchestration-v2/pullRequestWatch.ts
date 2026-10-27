@@ -144,7 +144,13 @@ export function evaluatePullRequestWatch(
   const autofix =
     watch.autofix &&
     watch.autofixRounds < AUTOFIX_ROUND_LIMIT &&
-    fresh.some((remark) => Date.parse(remark.createdAt) > through && isCodeRabbitReview(remark));
+    fresh.some((remark) => {
+      const createdAt = Date.parse(remark.createdAt);
+      return (
+        (createdAt > through || (createdAt === through && !watch.remarkIds.includes(remark.id))) &&
+        isCodeRabbitReview(remark)
+      );
+    });
   const autofixRounds = watch.autofixRounds + (autofix ? 1 : 0);
   return {
     changes,
@@ -267,6 +273,21 @@ export function pullRequestAutofixMessage(input: {
       summary: `#${input.number}: CodeRabbit Autofix${input.autofixRounds >= AUTOFIX_ROUND_LIMIT ? ` ended after ${AUTOFIX_ROUND_LIMIT} rounds` : " requested"}`,
     },
   };
+}
+
+export function withoutPullRequestAutofixRequest(
+  text: string,
+  input: { readonly number: number; readonly url: string },
+): string {
+  // Match only the generated request for this PR, including its keep-watching instruction.
+  for (const state of [
+    { autofixRounds: 1 },
+    { autofixRounds: 1, stopped: true },
+    { autofixRounds: AUTOFIX_ROUND_LIMIT },
+  ]) {
+    text = text.replace(pullRequestAutofixMessage({ ...input, ...state }).text, "");
+  }
+  return text;
 }
 
 export function pullRequestWatchMessage(input: {

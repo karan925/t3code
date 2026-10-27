@@ -89,7 +89,11 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
-import { pullRequestAutofixMessage, pullRequestAutofixMessagePrefix } from "./pullRequestWatch.ts";
+import {
+  pullRequestAutofixMessage,
+  pullRequestAutofixMessagePrefix,
+  withoutPullRequestAutofixRequest,
+} from "./pullRequestWatch.ts";
 import {
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
@@ -2775,15 +2779,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           })
           .pipe(mapDispatchError(command));
         const prefix = pullRequestAutofixMessagePrefix(command);
-        const pending = new Set(
-          projection.messages
-            .filter((message) => message.id.startsWith(prefix))
-            .map((message) => message.id),
-        );
+        const messages = new Map(projection.messages.map((message) => [message.id, message]));
         const now = yield* DateTime.now;
+        const emitEvent = emit(events, command);
         for (const run of queued) {
-          if (!pending.has(run.userMessageId)) continue;
-          yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+          const message = messages.get(run.userMessageId);
+          if (message?.id.startsWith(prefix)) {
+            yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+            continue;
+          }
+          if (link === undefined || !message?.id.startsWith("message:pr-watch:")) continue;
+          const text = withoutPullRequestAutofixRequest(message.text, link);
+          if (text === message.text) continue;
+          yield* emitEvent({
+            type: "message.updated",
+            threadId: command.threadId,
+            runId: run.id,
+            ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...message, text, updatedAt: now },
+          });
         }
         return;
       }

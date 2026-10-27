@@ -2626,17 +2626,19 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }),
   );
 
-  it.effect.each([
-    { independent: false, news: "coderabbit" },
-    { independent: true, news: "coderabbit" },
-    { independent: false, news: "checks" },
-    { independent: false, news: "human" },
-  ] as const)(
-    "finishes the fifth Autofix round and preserves mixed queued news (%j)",
-    ({ independent, news }) =>
+  it.effect.each(
+    [
+      { independent: false, news: "coderabbit" },
+      { independent: true, news: "coderabbit" },
+      { independent: false, news: "checks" },
+      { independent: false, news: "human" },
+    ].flatMap((scenario) => [2, AUTOFIX_ROUND_LIMIT].map((round) => ({ ...scenario, round }))),
+  )(
+    "turning Autofix off revokes queued authorization while preserving mixed news (%j)",
+    ({ independent, news, round }) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
-        const suffix = `${independent}-${news}`;
+        const suffix = `${independent}-${news}-${round}`;
         const threadId = ThreadId.make(`runtime-autofix-round-limit-${suffix}`);
         const projectId = ProjectId.make(`autofix-limit-project-${suffix}`);
         yield* seedProject({
@@ -2702,7 +2704,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           number: watching.number,
           startedAt: started.startedAt,
           expectedAutofixGeneration: started.autofixGeneration,
-          watch: { ...started, headSha: "abc1234def", autofixRounds: AUTOFIX_ROUND_LIMIT - 1 },
+          watch: { ...started, headSha: "abc1234def", autofixRounds: round - 1 },
         };
         yield* orchestrator.dispatch(sync);
         const remark: PullRequestComment = {
@@ -2747,29 +2749,32 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         );
         yield* reactor.sweep;
         const watch = (yield* orchestrator.getThreadShell(threadId))?.pullRequests?.[0]?.watch;
-        if (independent) {
-          assert.isFalse(watch?.autofix);
-          assert.equal(watch?.autofixRounds, AUTOFIX_ROUND_LIMIT);
+        const ended = round === AUTOFIX_ROUND_LIMIT;
+        if (independent || !ended) {
+          assert.equal(watch?.autofix, !ended);
+          assert.equal(watch?.autofixRounds, round);
         } else assert.isUndefined(watch);
         const projection = yield* orchestrator.getThreadProjection(threadId);
         const wake = projection.messages.find((message) =>
-          message.notification?.summary.includes(
-            `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`,
-          ),
+          message.notification?.summary.includes("new comments"),
         )!;
         assert.isDefined(wake);
         assert.include(wake.text, "$autofix ");
-        assert.include(wake.text, `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`);
-        assert.include(wake.text, "turn it on again in the thread panel");
-        assert.equal(wake.text.includes("T3 Code stopped watching."), !independent);
+        if (ended) {
+          assert.include(wake.text, `Autofix ended after ${AUTOFIX_ROUND_LIMIT} rounds`);
+          assert.include(wake.text, "turn it on again in the thread panel");
+        }
+        assert.equal(wake.text.includes("T3 Code stopped watching."), ended && !independent);
         assert.equal(
           projection.runs.find((run) => run.userMessageId === wake.id)?.status,
           "queued",
         );
-        const rejected = yield* orchestrator
-          .dispatch({ ...sync, commandId: CommandId.make(`autofix-limit-stale-${suffix}`) })
-          .pipe(Effect.flip);
-        assert.equal(rejected._tag, "OrchestratorDispatchError");
+        if (ended) {
+          const rejected = yield* orchestrator
+            .dispatch({ ...sync, commandId: CommandId.make(`autofix-limit-stale-${suffix}`) })
+            .pipe(Effect.flip);
+          assert.equal(rejected._tag, "OrchestratorDispatchError");
+        }
         yield* orchestrator.dispatch({
           ...watching,
           commandId: CommandId.make(`autofix-limit-disable-${suffix}`),
@@ -2780,6 +2785,21 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           stopped.runs.find((run) => run.userMessageId === wake.id)?.status,
           news === "coderabbit" ? "cancelled" : "queued",
         );
+        if (news !== "coderabbit") {
+          const preserved = stopped.messages.find((message) => message.id === wake.id)!;
+          assert.include(preserved.text, news === "checks" ? "Checks failed" : "reviewer");
+          assert.notInclude(preserved.text, "$autofix");
+          assert.notInclude(preserved.text, "commit the fixes together");
+          assert.notInclude(preserved.text, "without asking for each one");
+          assert.notInclude(preserved.text, "do not call unwatch_pull_request");
+          const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+          assert.isTrue((yield* maintenance.rebuild).valid);
+          const rebuilt = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(
+            rebuilt.messages.find((message) => message.id === wake.id)?.text,
+            preserved.text,
+          );
+        }
         yield* orchestrator.dispatch({
           ...watching,
           commandId: CommandId.make(`autofix-limit-reenable-${suffix}`),

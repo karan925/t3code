@@ -1,4 +1,12 @@
-import { CodeRabbitError, type CodeRabbitStatus } from "@t3tools/contracts";
+import {
+  CodeRabbitError,
+  type CodeRabbitStatus,
+  defaultInstanceIdForDriver,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
+import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { CodeRabbitSettings } from "@t3tools/provider-coderabbit/settings";
 import * as Context from "effect/Context";
 import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -7,10 +15,13 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 
-const EXECUTABLE = "coderabbit";
+const DRIVER = ProviderDriverKind.make("coderabbit");
+const INSTANCE_ID = defaultInstanceIdForDriver(DRIVER);
+const decodeSettings = Schema.decodeUnknownEffect(CodeRabbitSettings);
 const SIGNED_OUT: CodeRabbitStatus = { installed: false, authenticated: false, account: null };
 const decodeJsonLine = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
@@ -60,16 +71,26 @@ const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const processes = yield* ProcessRunner.ProcessRunner;
   const providers = yield* ProviderRegistry.ProviderRegistry;
+  const settings = yield* ServerSettings.ServerSettingsService;
+  const homeDirectory = yield* HostProcess.HomeDirectory;
 
-  const run = (args: ReadonlyArray<string>, timeout: Duration.Input) =>
-    processes.run({
-      command: EXECUTABLE,
+  const run = Effect.fn("CodeRabbitCli.run")(function* (
+    args: ReadonlyArray<string>,
+    timeout: Duration.Input,
+  ) {
+    const current = yield* settings.getSettings;
+    const entry = current.providerInstances[INSTANCE_ID];
+    // Autofix uses this host-wide CLI even when CodeRabbit is disabled as a coding provider.
+    const configured = yield* decodeSettings(entry?.driver === DRIVER ? (entry.config ?? {}) : {});
+    return yield* processes.run({
+      command: expandHomePath(configured.binaryPath, homeDirectory),
       args,
       cwd: config.cwd,
       timeout,
       maxOutputBytes: 256_000,
       outputMode: "truncate",
     });
+  });
 
   const [status, invalidateStatus] = yield* Effect.cachedInvalidateWithTTL(
     run(["auth", "status", "--agent"], "10 seconds").pipe(

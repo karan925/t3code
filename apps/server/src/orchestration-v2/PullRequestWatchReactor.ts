@@ -568,7 +568,7 @@ export const make = Effect.gen(function* () {
           wake,
           // An ending watch keeps what this pass saw, so watching again starts from it.
           report.exhausted ? report.next : undefined,
-          // Mixed updates must survive turning Autofix off, which cancels only Autofix wakes.
+          // Disabling Autofix cancels review-only wakes and removes the request from mixed news.
           report.autofix &&
             report.changes.every(
               (change) => change.kind === "remarks" && change.remarks.every(isCodeRabbitReview),

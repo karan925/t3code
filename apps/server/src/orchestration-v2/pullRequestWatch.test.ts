@@ -10,6 +10,7 @@ import {
   PULL_REQUEST_WATCH_WAKE_LIMIT,
   evaluatePullRequestWatch as evaluate,
   pullRequestWatchMessage,
+  withoutPullRequestAutofixRequest,
 } from "./pullRequestWatch.ts";
 
 // These cases read the head once or at one moment, so the no-checks notice never comes due.
@@ -148,6 +149,34 @@ describe("evaluatePullRequestWatch", () => {
       assert.equal(report.next.remarksThrough, edited.editedAt);
     },
   );
+
+  it.each(["review", "review-comment"] as const)(
+    "starts Autofix once for an unseen CodeRabbit %s at the watermark",
+    (kind) => {
+      const seen = remark("reviewer", STARTED);
+      const review = { ...remark("coderabbitai[bot]", STARTED), kind };
+      const watching = watch({ autofix: true, autofixRounds: 1, remarkIds: [seen.id] });
+      const report = evaluatePullRequestWatch(watching, detail(), [seen, review]);
+      assert.deepEqual(report.changes, [{ kind: "remarks", remarks: [review] }]);
+      assert.isTrue(report.autofix);
+      assert.equal(report.next.autofixRounds, 2);
+      assert.deepEqual(report.next.remarkIds, [seen.id, review.id]);
+      assert.isFalse(evaluatePullRequestWatch(report.next, detail(), [seen, review]).autofix);
+    },
+  );
+
+  it("does not start Autofix for an unseen old review edited at the watermark", () => {
+    const review = {
+      ...remark("coderabbitai[bot]", "2026-10-02T11:00:00Z"),
+      editedAt: STARTED,
+    };
+    const report = evaluatePullRequestWatch(watch({ autofix: true, autofixRounds: 1 }), detail(), [
+      review,
+    ]);
+    assert.deepEqual(report.changes, [{ kind: "remarks", remarks: [review] }]);
+    assert.isFalse(report.autofix);
+    assert.equal(report.next.autofixRounds, 1);
+  });
 
   it("carries autofix into the next watch state", () => {
     for (const autofix of [true, false]) {
@@ -481,6 +510,46 @@ describe("evaluatePullRequestWatch", () => {
 });
 
 describe("pullRequestWatchMessage", () => {
+  it.each([false, true])(
+    "removes only this PR's Autofix request from mixed news (exhausted: %s)",
+    (exhausted) => {
+      const report = evaluatePullRequestWatch(
+        watch({
+          autofix: true,
+          headSha: "aaaaaaaaaa",
+          wakes: exhausted ? PULL_REQUEST_WATCH_WAKE_LIMIT - 1 : 0,
+        }),
+        detail(),
+        [
+          remark("coderabbitai[bot]", "2026-10-02T12:10:00Z"),
+          remark("reviewer", "2026-10-02T12:10:00Z", "Keep this ordinary news."),
+        ],
+      );
+      const reference = { number: 12, url: "https://github.com/o/r/pull/12" };
+      const { text } = pullRequestWatchMessage({
+        ...reference,
+        baseBranch: "main",
+        headSha: report.next.headSha,
+        report,
+      });
+      assert.isTrue(report.autofix);
+      assert.equal(report.exhausted, exhausted);
+      assert.equal(
+        withoutPullRequestAutofixRequest(text, {
+          number: 12,
+          url: "https://github.com/other/repository/pull/12",
+        }),
+        text,
+      );
+      const revoked = withoutPullRequestAutofixRequest(text, reference);
+      assert.include(revoked, "Keep this ordinary news.");
+      assert.include(revoked, "coderabbitai[bot]");
+      assert.notInclude(revoked, "$autofix");
+      assert.notInclude(revoked, "commit the fixes together");
+      assert.notInclude(revoked, "do not call unwatch_pull_request");
+    },
+  );
+
   it.each([false, true])(
     "does not invoke Autofix for a top-level summary (edited: %s)",
     (edited) => {

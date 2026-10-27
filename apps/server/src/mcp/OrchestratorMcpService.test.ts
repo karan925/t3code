@@ -2601,11 +2601,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     it.effect("refuses inheritance when every target mode exceeds the parent", () =>
       Effect.gen(function* () {
         for (const mode of ["approval-required", "auto-accept-edits", "auto"] as const) {
-          const error = yield* resolveRuntimeMode(
-            mode,
-            "inherit",
-            codeRabbit,
-          ).pipe(Effect.flip);
+          const error = yield* resolveRuntimeMode(mode, "inherit", codeRabbit).pipe(Effect.flip);
           assert.equal(error.code, "invalid_request");
           assert.include(error.message, mode);
           assert.include(error.message, "full-access");

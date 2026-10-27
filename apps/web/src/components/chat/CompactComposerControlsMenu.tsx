@@ -19,6 +19,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
   runtimeModeOptions: ReadonlyArray<{
     readonly mode: RuntimeMode;
     readonly label: string;
+    readonly disabled?: boolean;
   }>;
   showInteractionModeToggle: boolean;
   traitsMenuContent?: ReactNode;
@@ -80,7 +81,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           }}
         >
           {props.runtimeModeOptions.map((option) => (
-            <MenuRadioItem key={option.mode} value={option.mode}>
+            <MenuRadioItem key={option.mode} value={option.mode} disabled={option.disabled}>
               {option.label}
             </MenuRadioItem>
           ))}

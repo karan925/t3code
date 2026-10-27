@@ -203,8 +203,12 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver: DRIVER,
-    getCapabilities: () => Effect.succeed(codeRabbitCapabilities),
-    planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
+    getCapabilities: Effect.fn("CodeRabbit.getCapabilities")(() =>
+      Effect.succeed(codeRabbitCapabilities),
+    ),
+    planSelectionTransition: Effect.fn("CodeRabbit.planSelectionTransition")(() =>
+      Effect.succeed(turnScopedSelectionTransition()),
+    ),
     openSession: Effect.fn("CodeRabbit.openSession")(function* (input) {
       if (input.runtimePolicy.runtimeMode !== "full-access")
         return yield* protocolError("CodeRabbit runs remotely and only supports full-access mode");
@@ -360,9 +364,7 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
           dispatchIfCurrent: (dispatch) =>
             eventPermit.withPermits(1)(
               Effect.suspend(() =>
-                pendingWake === wake && !closed
-                  ? dispatch.pipe(Effect.map(Option.some))
-                  : Effect.succeed(Option.none()),
+                pendingWake === wake && !closed ? dispatch.pipe(Effect.asSome) : Effect.succeedNone,
               ),
             ),
           clearIfCurrent: () =>
@@ -692,10 +694,9 @@ export const makeCodeRabbitAdapterV2 = Effect.fn("makeCodeRabbitAdapterV2")(func
                 turn.finished || closed
                   ? Effect.succeed(null)
                   : fetchLatestTurn({ ...taskOptions, taskId }).pipe(
-                      Effect.flatMap((result) =>
-                        matchesTurn(turn, result.turn)
-                          ? Effect.succeed(result)
-                          : Effect.fail(new CommandError({ operation: "fetch current turn" })),
+                      Effect.filterOrFail(
+                        (result) => matchesTurn(turn, result.turn),
+                        () => new CommandError({ operation: "fetch current turn" }),
                       ),
                     ),
               ).pipe(
