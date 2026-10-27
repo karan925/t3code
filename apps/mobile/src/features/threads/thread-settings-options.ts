@@ -27,7 +27,7 @@ export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
   },
 ];
 
-export function runtimeModeChoicesForSupportedModes(
+function runtimeModeChoicesForSupportedModes(
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
 ) {
   return supportedRuntimeModes && supportedRuntimeModes.length > 0
@@ -35,13 +35,21 @@ export function runtimeModeChoicesForSupportedModes(
     : RUNTIME_MODE_CHOICES;
 }
 
-export function compatibleRuntimeModeForChoices(
+export function runtimeModeStateForSupportedModes(
   runtimeMode: RuntimeMode,
-  choices: ReadonlyArray<{ readonly mode: RuntimeMode }>,
-): RuntimeMode {
-  return choices.some((choice) => choice.mode === runtimeMode)
-    ? runtimeMode
-    : (choices[0]?.mode ?? runtimeMode);
+  supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
+) {
+  const choices = runtimeModeChoicesForSupportedModes(supportedRuntimeModes);
+  const supported = choices.some((choice) => choice.mode === runtimeMode);
+  const label =
+    RUNTIME_MODE_CHOICES.find((choice) => choice.mode === runtimeMode)?.label ?? runtimeMode;
+  return {
+    choices,
+    label: supported ? label : `${label} (unsupported)`,
+    sendBlockedReason: supported
+      ? null
+      : "Select a supported runtime mode in thread settings before sending.",
+  };
 }
 
 export { selectableProviderOptionChoices as selectableChoices } from "@t3tools/client-runtime/model-traits";

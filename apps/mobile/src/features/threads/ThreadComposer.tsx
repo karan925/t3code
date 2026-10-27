@@ -86,6 +86,7 @@ import {
   type DraftComposerFileAttachment,
 } from "../../lib/composerImages";
 import { buildModelOptions, isModelSelectionUnavailable } from "../../lib/modelOptions";
+import { runtimeModeStateForSupportedModes } from "./thread-settings-options";
 import { useScaledTextRole, type ScaledTextRole } from "../settings/appearance/useScaledTextRole";
 import type { RemoteClientConnectionState } from "../../lib/connection";
 import { MOBILE_TYPOGRAPHY } from "../../lib/typography";
@@ -518,6 +519,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
       currentModelSelection.instanceId,
       props.serverConfig?.providers ?? [],
       props.serverConfig?.usageLimitSources ?? [],
+      // oxlint-disable-next-line react/purity -- runs in an event handler (oxc#27309)
       Date.now(),
     );
     onShowUsageLimits(report);
@@ -592,9 +594,14 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     states: uploadStates,
   });
   const contextImports = useAtomValue(composerContextImportsAtom);
+  const runtimeModeState = runtimeModeStateForSupportedModes(
+    props.selectedThread.runtimeMode,
+    selectedProviderStatus?.supportedRuntimeModes,
+  );
   const sendBlockedReason =
     (queuedEdit?.saving === true ? "Saving…" : null) ??
     props.sendBlockedReason ??
+    runtimeModeState.sendBlockedReason ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
     attachmentBlockReason;
   const canSend =

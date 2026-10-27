@@ -107,11 +107,7 @@ import {
 import { useNativeLayoutMetrics } from "../../native/native-layout-metrics";
 import { useNativeMailSearchToolbar } from "../../native/use-native-mail-search-toolbar";
 import { ModelRow, ChoiceRow } from "./ThreadSettingsRows";
-import {
-  compatibleRuntimeModeForChoices,
-  runtimeModeChoicesForSupportedModes,
-  selectableChoices,
-} from "./thread-settings-options";
+import { runtimeModeStateForSupportedModes, selectableChoices } from "./thread-settings-options";
 import {
   canCommitPendingModel,
   favoritesFirst,
@@ -298,7 +294,7 @@ type ThreadSettingsSessionValue = {
   readonly manageHidden: boolean;
   readonly setManageHidden: (value: boolean) => void;
   readonly runtimeMode: RuntimeMode;
-  readonly runtimeModeChoices: ReturnType<typeof runtimeModeChoicesForSupportedModes>;
+  readonly runtimeModeState: ReturnType<typeof runtimeModeStateForSupportedModes>;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
   readonly displayedDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
   readonly promptTraits: ReturnType<typeof getPromptControlledTraits>;
@@ -504,12 +500,9 @@ function ThreadSettingsSessionProvider(
     pendingModel ??
     props.providerGroups.flatMap((group) => group.models).find((option) => isApplied(option)) ??
     null;
-  const runtimeModeChoices = runtimeModeChoicesForSupportedModes(
-    displayedModel?.supportedRuntimeModes,
-  );
-  const compatibleRuntimeMode = compatibleRuntimeModeForChoices(
+  const runtimeModeState = runtimeModeStateForSupportedModes(
     props.runtimeMode,
-    runtimeModeChoices,
+    displayedModel?.supportedRuntimeModes,
   );
 
   const hasLegacyModels = props.providerGroups.some((group) =>
@@ -606,8 +599,8 @@ function ThreadSettingsSessionProvider(
     setManageHidden,
     toggleHidden,
     pendingHiddenKeys,
-    runtimeMode: compatibleRuntimeMode,
-    runtimeModeChoices,
+    runtimeMode: props.runtimeMode,
+    runtimeModeState,
     onUpdateRuntimeMode: props.onUpdateRuntimeMode,
     displayedDescriptors,
     promptTraits,
@@ -889,10 +882,7 @@ function ThreadSettingsOptionsItem(props: {
           <DisclosureRow
             isLast
             label="Runtime"
-            value={
-              session.runtimeModeChoices.find((choice) => choice.mode === session.runtimeMode)
-                ?.label
-            }
+            value={session.runtimeModeState.label}
             onPress={() => props.onOpenSubmenu({ kind: "runtime" })}
           />
         </Animated.View>
@@ -1088,7 +1078,7 @@ function ThreadSettingsChoiceContent(props: {
   const submenuContent =
     props.submenu.kind === "runtime"
       ? {
-          rows: session.runtimeModeChoices.map((choice) => ({
+          rows: session.runtimeModeState.choices.map((choice) => ({
             id: choice.mode,
             label: choice.label,
             description: choice.description,
@@ -1155,6 +1145,11 @@ function ThreadSettingsChoiceContent(props: {
       contentInsetAdjustmentBehavior="automatic"
       showsVerticalScrollIndicator={false}
     >
+      {props.submenu.kind === "runtime" && session.runtimeModeState.sendBlockedReason ? (
+        <Text className="px-4 pb-4 text-sm text-foreground-muted">
+          {session.runtimeModeState.label}. {session.runtimeModeState.sendBlockedReason}
+        </Text>
+      ) : null}
       <View className="overflow-hidden rounded-2xl bg-grouped-card">
         {submenuContent.rows.map((row, index) => (
           <ChoiceRow

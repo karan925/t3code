@@ -5,7 +5,7 @@ import {
 import type { ProviderOptionDescriptor } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { selectableChoices } from "./thread-settings-options";
+import { runtimeModeStateForSupportedModes, selectableChoices } from "./thread-settings-options";
 
 const effortDescriptor: Extract<ProviderOptionDescriptor, { type: "select" }> = {
   id: "effort",
@@ -85,5 +85,51 @@ describe("prompt-controlled reasoning", () => {
         "ultrathink",
       ),
     ).toEqual({ prompt: "/review" });
+  });
+});
+
+describe("runtimeModeStateForSupportedModes", () => {
+  it("keeps retained Supervised visible and requires an explicit Full access selection", () => {
+    const retained = runtimeModeStateForSupportedModes("approval-required", ["full-access"]);
+    expect(retained.label).toBe("Supervised (unsupported)");
+    expect(retained.sendBlockedReason).toBe(
+      "Select a supported runtime mode in thread settings before sending.",
+    );
+    expect(retained.choices.map((choice) => choice.mode)).toEqual(["full-access"]);
+    expect(retained.choices.some((choice) => choice.mode === "approval-required")).toBe(false);
+
+    const selected = runtimeModeStateForSupportedModes("full-access", ["full-access"]);
+    expect(selected.label).toBe("Full access");
+    expect(selected.sendBlockedReason).toBeNull();
+  });
+
+  it("blocks every unsupported retained mode without choosing a replacement", () => {
+    for (const mode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+      const state = runtimeModeStateForSupportedModes(mode, ["full-access"]);
+      expect(state.label).toContain("(unsupported)");
+      expect(state.sendBlockedReason).not.toBeNull();
+    }
+  });
+
+  it("keeps all modes available when providers do not declare a restriction", () => {
+    for (const supportedModes of [undefined, []]) {
+      const state = runtimeModeStateForSupportedModes("approval-required", supportedModes);
+      expect(state.label).toBe("Supervised");
+      expect(state.choices).toHaveLength(4);
+      expect(state.sendBlockedReason).toBeNull();
+    }
+  });
+
+  it("allows a supported retained mode for providers with multiple choices", () => {
+    const state = runtimeModeStateForSupportedModes("auto-accept-edits", [
+      "approval-required",
+      "auto-accept-edits",
+    ]);
+    expect(state.label).toBe("Auto-accept edits");
+    expect(state.sendBlockedReason).toBeNull();
+    expect(state.choices.map((choice) => choice.mode)).toEqual([
+      "approval-required",
+      "auto-accept-edits",
+    ]);
   });
 });
