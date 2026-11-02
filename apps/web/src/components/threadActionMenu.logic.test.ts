@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildThreadActionMenuItems, type ThreadActionMenuState } from "./threadActionMenu.logic";
+import {
+  buildThreadActionMenuItems,
+  threadActionRequiresOperate,
+  type ThreadActionMenuState,
+} from "./threadActionMenu.logic";
 
 const baseState: ThreadActionMenuState = {
   canOperate: true,
@@ -26,6 +30,28 @@ const baseState: ThreadActionMenuState = {
 };
 
 describe("buildThreadActionMenuItems", () => {
+  it("offers local folder actions for pinned chats even with read-only server access", () => {
+    const items = buildThreadActionMenuItems({
+      ...baseState,
+      canOperate: false,
+      isPinned: true,
+      pinnedFolders: [{ id: "work", name: "Work" }],
+    });
+    const menu = items.find((item) => item.id === "pinned-folder");
+    expect(menu?.disabled).not.toBe(true);
+    expect(menu?.children?.map((item) => item.id)).toEqual([
+      "pinned-folder-none",
+      "pinned-folder:work",
+      "pinned-folder-new",
+    ]);
+    expect(menu?.children?.some((item) => item.disabled)).toBe(false);
+    expect(threadActionRequiresOperate("pinned-folder:work")).toBe(false);
+    expect(
+      buildThreadActionMenuItems({ ...baseState, pinnedFolders: [] }).some(
+        (item) => item.id === "pinned-folder",
+      ),
+    ).toBe(false);
+  });
   it.each([false, true])(
     "disables both lifecycle directions without permission (reversed: %s)",
     (reversed) => {

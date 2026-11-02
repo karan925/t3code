@@ -5,6 +5,8 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { usePinFolderThread } from "../../hooks/usePinFolderThread";
+import { submittedDraftFolder } from "../../sidebarPinnedFolderStorage";
 import { deriveThreadTitleSeed } from "@t3tools/client-runtime/operations";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
@@ -79,6 +81,7 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
+  const pinFolderThread = usePinFolderThread();
   const clearComposerDraftContent = useComposerDraftStore((store) => store.clearComposerContent);
   const fanoutSelectionsAtom = draftFanoutSelectionsAtom(routeThreadKey);
   const { sendInFlight: sendInFlightRef, uncertainSubmissions: uncertainSubmissionsRef } =
@@ -148,6 +151,7 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
           clearedDraftSnapshot &&
         appAtomRegistry.get(fanoutSelectionsAtom) === submittedSelections;
       setThreadError(threadId, null);
+      const folderId = submittedDraftFolder(draftId);
       const starts = Promise.all(
         targets.map(async (target) => {
           const started = await startFanoutThread({
@@ -158,11 +162,11 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
             ]),
             model: target.selection.model,
             uncertainSubmissions: uncertainSubmissionsRef.current,
-            start: (targetThreadId) => {
+            start: async (targetThreadId) => {
               const supportsInlineMessageContext =
                 appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment
                   .capabilities.inlineMessageContext === true;
-              return startThreadTurn({
+              const result = await startThreadTurn({
                 environmentId,
                 input: {
                   threadId: targetThreadId,
@@ -202,6 +206,10 @@ export function useMultipleModelSend(input: MultipleModelSendInput) {
                   createdAt: createdAt,
                 },
               });
+              if (result._tag !== "Failure") {
+                await pinFolderThread(folderId, scopeThreadRef(environmentId, targetThreadId));
+              }
+              return result;
             },
             openThread: (threadId) =>
               void navigate({

@@ -2,6 +2,10 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 
 export type ThreadActionMenuId =
+  | "pinned-folder"
+  | "pinned-folder-new"
+  | "pinned-folder-none"
+  | `pinned-folder:${string}`
   | "new-thread-on-branch"
   | "filter-by-project"
   | "project-settings"
@@ -65,6 +69,7 @@ export function buildDraftActionMenuItems(options: {
 }
 
 export interface ThreadActionMenuState {
+  readonly pinnedFolders?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
   readonly canOperate: boolean;
   readonly branch: string | null;
   readonly projectFilter: {
@@ -93,6 +98,7 @@ export interface ThreadActionMenuState {
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
 export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean {
+  if (action.startsWith("pinned-folder")) return false;
   return ![
     "new-thread-on-branch",
     "project-settings",
@@ -109,6 +115,9 @@ export function buildThreadActionMenuItems(
   state: ThreadActionMenuState,
 ): ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> {
   const items: ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> = [
+    ...(state.isPinned && state.pinnedFolders
+      ? [buildPinnedFolderMenuItem(state.pinnedFolders)]
+      : []),
     ...(state.branch
       ? [
           {
@@ -239,4 +248,22 @@ export function buildThreadActionMenuItems(
             }
           : item,
       );
+}
+
+export function buildPinnedFolderMenuItem(
+  folders: ReadonlyArray<{ readonly id: string; readonly name: string }>,
+): ContextMenuItem<ThreadActionMenuId> {
+  return {
+    id: "pinned-folder",
+    label: "Move to folder",
+    icon: "folder",
+    children: [
+      { id: "pinned-folder-none", label: "Pinned (no folder)" },
+      ...folders.map((folder) => ({
+        id: `pinned-folder:${folder.id}` as const,
+        label: folder.name,
+      })),
+      { id: "pinned-folder-new", label: "New folder…", separatorBefore: true },
+    ],
+  };
 }

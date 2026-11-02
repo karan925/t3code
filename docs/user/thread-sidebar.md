@@ -70,6 +70,12 @@ scroll position instead of following the thread to its new place in the list.
 
 Pinning does not prevent automatic settlement. Settling a thread removes its pin.
 
+On web and desktop, choose **New pinned folder** beside the sidebar search to create a local
+folder. Use a pinned thread's **Move to folder** menu, or drag it into a folder. You can move
+several selected pinned threads together through the menu. Choose **Pinned (no folder)** to
+move them out. A folder's menu lets you rename it or delete it while keeping its chats pinned.
+Folders and their assignments stay on this device and do not sync to other clients.
+
 On web and desktop, drag a thread between sections to change its state. Drag a thread up into
 the pinned section to pin it at the spot you drop it; drag a pinned thread down into the active
 list to unpin it. Dragging a thread onto the **Settled** header settles it, and dragging a settled
@@ -122,22 +128,8 @@ rename a thread, regenerate its title, or link and unlink a pull request. These 
 appear on web, desktop, and mobile without requiring the originating browser to remain
 open.
 
-### Fold working threads (beta)
-
-Threads that are working or waiting on work they will resume from move into a collapsed
-**Working** section below the active list.
-That includes subagents, watched pull requests, and background commands or monitors the agent
-says it is waiting on. A dev server or other process an agent leaves running does not keep a thread
-there. A thread returns to the top of the active list when it finishes, fails, or needs an approval or
-answer. The Working section lists the thread you last sent work to first. Pinned threads stay in
-the pinned section.
-
-This is on by default. Turn it off with **Settings → General → Working section** on web and desktop,
-or **Settings → General → Working section** on iOS and Android. Each device keeps its own
-choice.
-
-While this is on, the active list is ordered by when each thread last came back to you, so you
-cannot drag or move threads within it. Your saved order returns when you turn it off.
+Working threads stay in their existing positions on web and desktop, including their pinned
+folders. Starting or finishing work does not move a thread into a separate Working section.
 
 ## Settle finished work
 

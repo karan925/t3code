@@ -107,6 +107,8 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { fileAttachmentCapabilityBlockReason } from "./composerAttachmentFiles";
 import { readEnvironmentScope } from "../../state/session";
 import { useOrchestrationCommand } from "../../state/use-orchestration-command";
+import { usePinFolderThread } from "../../hooks/usePinFolderThread";
+import { submittedDraftFolder } from "../../sidebarPinnedFolderStorage";
 import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
   threadContextsOutsideEnvironment,
@@ -332,6 +334,7 @@ export function useComposerSend(input: ComposerSendInput) {
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
+  const pinFolderThread = usePinFolderThread();
   const uploadThreadFeedback = useOrchestrationCommand(threadEnvironment.uploadFeedback, {
     reportFailure: false,
   });
@@ -1331,11 +1334,13 @@ export function useComposerSend(input: ComposerSendInput) {
           );
         }
       }
+      const folderId = submittedDraftFolder(draftId);
       const startResult = await startPromise;
       if (startResult._tag === "Failure") {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        await pinFolderThread(folderId, scopeThreadRef(environmentId, threadIdForSend));
         setKeepFullHistory(routeThreadKey, false);
         clearUsageLimitsFor(routeThreadKey);
         if (turnUsesAttachmentUploads) {
